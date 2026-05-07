@@ -1,0 +1,416 @@
+import logging
+from django.utils import timezone
+from django.core.cache import cache
+from django.db.models import Q
+from rest_framework import status
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework.permissions import IsAuthenticated
+from django.core.exceptions import ValidationError
+
+from warship.models import GameSession, ShipPlacement, GameMove
+from warship.matchmaking import find_opponent_from_queue
+from warship.centrifugo import publish_to_game, publish_to_user, generate_centrifugo_token
+
+logger = logging.getLogger('ws_app')
+
+class CentrifugoTokenAPIView(APIView):
+    """Эндпоинт для получения JWT токена Centrifugo"""
+    permission_classes = [IsAuthenticated]
+    
+    def get(self, request):
+        token = generate_centrifugo_token(request.user.id)
+        return Response({'token': token})
+
+
+class MatchmakingFindAPIView(APIView):
+    """Запрос на поиск игры"""
+    permission_classes = [IsAuthenticated]
+    
+    def get_active_game_data(self, user):
+        try:
+            active_game = GameSession.objects.select_related(
+                'player1', 'player2', 'current_turn'
+            ).filter(
+                Q(player1=user) | Q(player2=user)
+            ).exclude(
+                status__in=[
+                    GameSession.GameStatus.FINISHED,
+                    GameSession.GameStatus.CANCELLED
+                ]
+            ).order_by('-started_at').first()
+            
+            if not active_game:
+                return None
+            
+            opponent = active_game.player2 if active_game.player1_id == user.id else active_game.player1
+            return {
+                'game_id': active_game.id,
+                'status': active_game.status,
+                'opponent': {
+                    'id': opponent.id if opponent else None,
+                    'username': opponent.username if opponent else None,
+                } if opponent else None,
+                'player1': {
+                    'id': active_game.player1.id,
+                    'username': active_game.player1.username
+                },
+                'player2': {
+                    'id': active_game.player2.id if active_game.player2 else None,
+                    'username': active_game.player2.username if active_game.player2 else None,
+                } if active_game.player2 else None,
+                'current_turn': {
+                    'id': active_game.current_turn.id,
+                    'username': active_game.current_turn.username,
+                } if active_game.current_turn else None,
+            }
+        except Exception as e:
+            logger.error(f"Ошибка при получении активной игры для пользователя {user.id}: {e}")
+            return None
+
+    def post(self, request):
+        user = request.user
+        
+        # Проверяем наличие активных игр
+        active_game_data = self.get_active_game_data(user)
+        if active_game_data:
+            return Response({
+                'action': 'active_game_found',
+                'status': 'success',
+                'data': active_game_data
+            })
+            
+        # Работа с очередью
+        queue = cache.get('matchmaking_queue', {})
+        
+        # Ищем противника
+        opponent = find_opponent_from_queue(user, queue)
+        
+        if opponent:
+            # Проверяем не создана ли уже игра
+            existing_game = GameSession.objects.filter(
+                Q(player1=user, player2=opponent) | Q(player1=opponent, player2=user)
+            ).exclude(
+                status__in=[GameSession.GameStatus.FINISHED, GameSession.GameStatus.CANCELLED]
+            ).first()
+            
+            if existing_game:
+                game_session = existing_game
+            else:
+                game_session = GameSession.objects.create(
+                    player1=user,
+                    player2=opponent,
+                    status=GameSession.GameStatus.WAITING_SHIPS
+                )
+            
+            # Удаляем из очереди
+            queue.pop(user.id, None)
+            queue.pop(opponent.id, None)
+            cache.set('matchmaking_queue', queue, timeout=3600)
+            
+            # Уведомляем обоих игроков через Centrifugo
+            message_data_base = {
+                'game_id': game_session.id,
+                'player1': {'id': game_session.player1.id, 'username': game_session.player1.username},
+                'player2': {'id': game_session.player2.id, 'username': game_session.player2.username}
+            }
+            
+            # Уведомление первому
+            publish_to_user(game_session.player1.id, {
+                'action': 'game_found',
+                'status': 'success',
+                'data': {
+                    'opponent': {'id': game_session.player2.id, 'username': game_session.player2.username},
+                    **message_data_base
+                }
+            })
+            
+            # Уведомление второму
+            publish_to_user(game_session.player2.id, {
+                'action': 'game_found',
+                'status': 'success',
+                'data': {
+                    'opponent': {'id': game_session.player1.id, 'username': game_session.player1.username},
+                    **message_data_base
+                }
+            })
+            
+            return Response({
+                'action': 'game_found',
+                'status': 'success',
+                'message': 'Противник найден'
+            })
+        else:
+            # Добавляем в очередь
+            queue[user.id] = {
+                'user': user,
+                'started_at': timezone.now()
+            }
+            cache.set('matchmaking_queue', queue, timeout=3600)
+            
+            return Response({
+                'action': 'search_started',
+                'status': 'success',
+                'message': 'Поиск противника начат'
+            })
+
+
+class MatchmakingCancelAPIView(APIView):
+    """Отмена поиска игры"""
+    permission_classes = [IsAuthenticated]
+    
+    def post(self, request):
+        queue = cache.get('matchmaking_queue', {})
+        if request.user.id in queue:
+            del queue[request.user.id]
+            cache.set('matchmaking_queue', queue, timeout=3600)
+            
+        return Response({
+            'action': 'search_cancelled',
+            'status': 'success',
+            'message': 'Поиск игры отменен'
+        })
+
+
+# --- Вспомогательные функции для Game API ---
+
+def get_game_status_data(game_session):
+    player1_placement = ShipPlacement.objects.filter(
+        game_session=game_session, player=game_session.player1
+    ).first()
+    player2_placement = ShipPlacement.objects.filter(
+        game_session=game_session, player=game_session.player2
+    ).first()
+    
+    moves_raw = list(GameMove.objects.filter(
+        game_session=game_session
+    ).order_by('created_at').values(
+        'id', 'player_id', 'row', 'col', 'hit', 'ship_destroyed', 'ship_size', 'created_at'
+    ))
+    
+    moves = []
+    for move in moves_raw:
+        move_data = dict(move)
+        if move_data.get('created_at'):
+            move_data['created_at'] = move_data['created_at'].isoformat()
+        moves.append(move_data)
+    
+    current_turn_data = None
+    if game_session.current_turn:
+        current_turn_data = {
+            'id': game_session.current_turn.id,
+            'username': game_session.current_turn.username,
+        }
+    
+    return {
+        'game_id': game_session.id,
+        'status': game_session.status,
+        'player1': {
+            'id': game_session.player1.id,
+            'username': game_session.player1.username,
+            'ships_placed': player1_placement.ships_placed if player1_placement else False,
+        },
+        'player2': {
+            'id': game_session.player2.id if game_session.player2 else None,
+            'username': game_session.player2.username if game_session.player2 else None,
+            'ships_placed': player2_placement.ships_placed if player2_placement else False,
+        } if game_session.player2 else None,
+        'current_turn': current_turn_data,
+        'winner': {
+            'id': game_session.winner.id,
+            'username': game_session.winner.username,
+        } if game_session.winner else None,
+        'board_size': game_session.board_size,
+        'started_at': game_session.started_at.isoformat() if game_session.started_at else None,
+        'finished_at': game_session.finished_at.isoformat() if game_session.finished_at else None,
+        'moves': moves,
+    }
+
+
+def broadcast_game_status(game_session):
+    status_data = get_game_status_data(game_session)
+    publish_to_game(game_session.id, {
+        'action': 'game_status',
+        'status': 'success',
+        'data': status_data
+    })
+
+
+class GameStatusAPIView(APIView):
+    """Получение статуса игры"""
+    permission_classes = [IsAuthenticated]
+    
+    def get(self, request, game_id):
+        game_session = GameSession.objects.filter(id=game_id).first()
+        if not game_session:
+            return Response({'error': 'Игра не найдена'}, status=404)
+        
+        return Response({
+            'action': 'game_status',
+            'status': 'success',
+            'data': get_game_status_data(game_session)
+        })
+
+
+class GameBoardAPIView(APIView):
+    """Получение состояния доски"""
+    permission_classes = [IsAuthenticated]
+    
+    def get(self, request, game_id):
+        game_session = GameSession.objects.filter(id=game_id).first()
+        if not game_session:
+            return Response({'error': 'Игра не найдена'}, status=404)
+            
+        my_placement = ShipPlacement.objects.filter(
+            game_session=game_session,
+            player=request.user
+        ).first()
+        
+        opponent = game_session.player2 if game_session.player1_id == request.user.id else game_session.player1
+        
+        my_shots = list(GameMove.objects.filter(
+            game_session=game_session,
+            player=request.user
+        ).values('row', 'col', 'hit', 'ship_destroyed', 'ship_size'))
+        
+        opponent_shots = list(GameMove.objects.filter(
+            game_session=game_session,
+            player=opponent
+        ).values('row', 'col', 'hit', 'ship_destroyed', 'ship_size')) if opponent else []
+        
+        return Response({
+            'action': 'board_state',
+            'status': 'success',
+            'data': {
+                'my_ships': my_placement.ships if my_placement else [],
+                'my_shots': my_shots,
+                'opponent_shots': opponent_shots,
+                'board_size': game_session.board_size,
+            }
+        })
+
+
+class GamePlaceShipsAPIView(APIView):
+    """Размещение кораблей"""
+    permission_classes = [IsAuthenticated]
+    
+    def post(self, request, game_id):
+        ships_data = request.data.get('ships', [])
+        if not ships_data:
+            return Response({'error': 'Не указаны корабли для размещения'}, status=400)
+            
+        game_session = GameSession.objects.filter(id=game_id).first()
+        if not game_session:
+            return Response({'error': 'Игра не найдена'}, status=404)
+            
+        if game_session.status != GameSession.GameStatus.WAITING_SHIPS:
+            return Response({'error': 'Игра уже начата, нельзя размещать корабли'}, status=400)
+            
+        placement, _ = ShipPlacement.objects.get_or_create(
+            game_session=game_session,
+            player=request.user,
+            defaults={'ships': [], 'ships_placed': False}
+        )
+        
+        try:
+            placement.set_ships(ships_data)
+        except Exception as e:
+            return Response({'error': str(e)}, status=400)
+            
+        # Проверяем старт игры
+        player1_placement = ShipPlacement.objects.filter(game_session=game_session, player=game_session.player1).first()
+        player2_placement = ShipPlacement.objects.filter(game_session=game_session, player=game_session.player2).first()
+        
+        if player1_placement and player1_placement.ships_placed and player2_placement and player2_placement.ships_placed:
+            try:
+                game_session.start_game()
+                game_session.refresh_from_db()
+                
+                # Уведомляем о старте
+                current_turn_data = None
+                if game_session.current_turn:
+                    current_turn_data = {'id': game_session.current_turn.id, 'username': game_session.current_turn.username}
+                    
+                publish_to_game(game_session.id, {
+                    'action': 'game_started',
+                    'status': 'success',
+                    'data': {
+                        'game_id': game_session.id,
+                        'current_turn': current_turn_data,
+                        'started_at': game_session.started_at.isoformat() if game_session.started_at else None,
+                    }
+                })
+            except ValidationError:
+                pass
+                
+        broadcast_game_status(game_session)
+        
+        return Response({
+            'action': 'place_ships',
+            'status': 'success',
+            'message': 'Корабли успешно размещены'
+        })
+
+
+class GameMakeShotAPIView(APIView):
+    """Выполнение выстрела"""
+    permission_classes = [IsAuthenticated]
+    
+    def post(self, request, game_id):
+        row = request.data.get('row')
+        col = request.data.get('col')
+        
+        if row is None or col is None:
+            return Response({'error': 'Не указаны координаты выстрела (row, col)'}, status=400)
+            
+        game_session = GameSession.objects.filter(id=game_id).first()
+        if not game_session:
+            return Response({'error': 'Игра не найдена'}, status=404)
+            
+        if game_session.status == GameSession.GameStatus.WAITING_SHIPS:
+            return Response({'error': 'Игра еще не начата'}, status=400)
+            
+        if game_session.status == GameSession.GameStatus.FINISHED:
+            return Response({'error': 'Игра уже завершена'}, status=400)
+            
+        if game_session.current_turn_id != request.user.id:
+            return Response({'error': 'Сейчас не ваш ход'}, status=400)
+            
+        from warship.models import make_shot
+        try:
+            result = make_shot(game_session, request.user, row, col)
+        except Exception as e:
+            return Response({'error': str(e)}, status=400)
+            
+        if not result['success']:
+            return Response({'error': result.get('error', 'Ошибка выстрела')}, status=400)
+            
+        winner = result.get('winner')
+        result_to_send = dict(result)
+        if winner:
+            result_to_send['winner'] = {'id': winner.id, 'username': winner.username}
+            
+        publish_to_game(game_session.id, {
+            'action': 'shot_result',
+            'status': 'success',
+            'data': result_to_send
+        })
+        
+        broadcast_game_status(game_session)
+        
+        if result.get('game_finished'):
+            publish_to_game(game_session.id, {
+                'action': 'game_finished',
+                'status': 'success',
+                'data': {
+                    'game_id': game_session.id,
+                    'winner': result_to_send['winner'],
+                    'finished_at': game_session.finished_at.isoformat() if game_session.finished_at else None,
+                }
+            })
+            
+        return Response({
+            'action': 'make_shot',
+            'status': 'success',
+            'data': result_to_send
+        })
