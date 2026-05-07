@@ -1,43 +1,24 @@
-# Matchmaking - Поиск противника
+# Matchmaking - Поиск противника (REST + Centrifugo)
 
 ## Описание
 
-Система автоматического подбора противников для игры в морской бой. Подбор происходит на основе статистики игроков:
-- Процент побед (win rate)
-- Количество сыгранных игр
+Система автоматического подбора противников для игры в морской бой. 
+Работает на базе HTTP API для отправки запросов и Centrifugo для получения асинхронных уведомлений.
 
-## WebSocket подключение
+## Как начать поиск игры
 
-**Через query параметр (для обратной совместимости):**
-```
-ws://host/ws/matchmaking/?token=<jwt_token>
-```
+Для получения событий поиска клиент **обязательно** должен быть подключен к Centrifugo и подписан на свой персональный канал `user_<user_id>`.
 
-**Через заголовок Authorization (предпочтительно):**
-```
-ws://host/ws/matchmaking/
-```
-с заголовком: `Authorization: Bearer <jwt_token>`
-
-**Примечание:** Middleware сначала проверяет заголовок `Authorization`, затем query параметр `token`. Использование заголовка более безопасно, так как токен не попадает в URL и логи.
-
-## Действия
-
-### 1. Поиск игры (`find_game`)
-
-Запрашивает поиск противника и добавление в очередь. 
-
-**Важно:** Если у пользователя уже есть активная игра (не завершенная и не отмененная), система автоматически вернет информацию о ней вместо начала нового поиска.
+### 1. Запрос на поиск игры
+Запрашивает поиск противника. Если у пользователя уже есть активная (незавершенная) игра, бэкенд сразу вернет её. Иначе - добавит пользователя в очередь (кэш).
 
 **Запрос:**
-```json
-{
-  "action": "find_game",
-  "data": {}
-}
+```http
+POST /api/warship/matchmaking/find/
+Authorization: Bearer <jwt_token_django>
 ```
 
-**Ответ при наличии активной игры:**
+**Ответ при наличии активной игры (HTTP 200):**
 ```json
 {
   "action": "active_game_found",
@@ -45,27 +26,15 @@ ws://host/ws/matchmaking/
   "data": {
     "game_id": 24,
     "status": "player1_turn",
-    "opponent": {
-      "id": 2,
-      "username": "player2"
-    },
-    "player1": {
-      "id": 1,
-      "username": "player1"
-    },
-    "player2": {
-      "id": 2,
-      "username": "player2"
-    },
-    "current_turn": {
-      "id": 1,
-      "username": "player1"
-    }
+    "opponent": { "id": 2, "username": "player2" },
+    "player1": { "id": 1, "username": "player1" },
+    "player2": { "id": 2, "username": "player2" },
+    "current_turn": { "id": 1, "username": "player1" }
   }
 }
 ```
 
-**Ответ при начале поиска:**
+**Ответ, когда игрок добавлен в очередь (поиск начат) (HTTP 200):**
 ```json
 {
   "action": "search_started",
@@ -73,50 +42,45 @@ ws://host/ws/matchmaking/
   "message": "Поиск противника начат"
 }
 ```
+*В этот момент запрос завершается. Дальнейшее ожидание происходит асинхронно через прослушивание Centrifugo.*
 
-**Ответ при найденном противнике:**
+**Ответ, если противник сразу найден (в очереди уже кто-то был) (HTTP 200):**
+```json
+{
+  "action": "game_found",
+  "status": "success",
+  "message": "Противник найден"
+}
+```
+
+### 2. Событие: Игра найдена (через Centrifugo)
+
+Если вы получили `search_started`, вы просто ждете. Как только другой игрок выполнит `/api/warship/matchmaking/find/` и алгоритм подберет вас друг другу, вам обоим прилетит событие в канал `user_<user_id>`:
+
 ```json
 {
   "action": "game_found",
   "status": "success",
   "data": {
-    "game_id": 1,
-    "opponent": {
-      "id": 2,
-      "username": "player2"
-    },
-    "player1": {
-      "id": 1,
-      "username": "player1"
-    },
-    "player2": {
-      "id": 2,
-      "username": "player2"
-    }
+    "game_id": 42,
+    "opponent": { "id": 2, "username": "player2" },
+    "player1": { "id": 1, "username": "player1" },
+    "player2": { "id": 2, "username": "player2" }
   }
 }
 ```
+Увидев это событие, фронтенд переходит на экран игры и подписывается на канал `game_<game_id>`.
 
-После получения `active_game_found` или `game_found`, игрок должен подключиться к игровому WebSocket:
-```
-ws://host/ws/game/<game_id>/?token=<token>
-```
-
-**Примечание:** Если получен `active_game_found`, это означает, что у пользователя уже есть незавершенная игра, и он должен продолжить её, а не начинать новую.
-
-### 2. Отмена поиска (`cancel_search`)
-
-Отменяет поиск игры и удаляет игрока из очереди.
+### 3. Отмена поиска
+Отменяет поиск игры и удаляет игрока из очереди (из кэша).
 
 **Запрос:**
-```json
-{
-  "action": "cancel_search",
-  "data": {}
-}
+```http
+POST /api/warship/matchmaking/cancel/
+Authorization: Bearer <jwt_token_django>
 ```
 
-**Ответ:**
+**Ответ (HTTP 200):**
 ```json
 {
   "action": "search_cancelled",
@@ -126,96 +90,8 @@ ws://host/ws/game/<game_id>/?token=<token>
 ```
 
 ## Алгоритм подбора противника
-
 Подбор происходит по следующим критериям:
+1. Процент побед (win rate)
+2. Количество сыгранных игр
 
-1. **Процент побед (win rate)**
-   - Максимальная разница: 20%
-   - Если идеальный противник не найден, критерий расширяется до 40%
-
-2. **Количество игр**
-   - Максимальная разница: 50 игр
-   - Если идеальный противник не найден, критерий расширяется до 100 игр
-
-3. **Оценка совпадения**
-   - Рассчитывается как: `skill_diff * 2 + games_diff * 0.1`
-   - Выбирается противник с наименьшей оценкой
-
-## Пример использования
-
-```javascript
-// Подключение к matchmaking
-const matchmaking = new WebSocket('ws://localhost:8000/ws/matchmaking/?token=your_token');
-
-matchmaking.onopen = () => {
-  // Запрашиваем поиск игры
-  matchmaking.send(JSON.stringify({
-    action: 'find_game',
-    data: {}
-  }));
-};
-
-matchmaking.onmessage = (event) => {
-  const message = JSON.parse(event.data);
-  
-  switch (message.action) {
-    case 'active_game_found':
-      const activeGameId = message.data.game_id;
-      console.log('Найдена активная игра! ID:', activeGameId);
-      console.log('Противник:', message.data.opponent.username);
-      console.log('Текущий ход:', message.data.current_turn.username);
-      
-      // Подключаемся к существующей игре
-      const activeGameWs = new WebSocket(
-        `ws://localhost:8000/ws/game/${activeGameId}/?token=your_token`
-      );
-      
-      // Настраиваем обработчики игрового WebSocket
-      setupGameWebSocket(activeGameWs);
-      break;
-      
-    case 'search_started':
-      console.log('Поиск начат...');
-      break;
-      
-    case 'game_found':
-      const gameId = message.data.game_id;
-      console.log('Игра найдена! ID:', gameId);
-      console.log('Противник:', message.data.opponent.username);
-      
-      // Подключаемся к игровому WebSocket
-      const gameWs = new WebSocket(
-        `ws://localhost:8000/ws/game/${gameId}/?token=your_token`
-      );
-      
-      // Настраиваем обработчики игрового WebSocket
-      setupGameWebSocket(gameWs);
-      break;
-      
-    case 'search_cancelled':
-      console.log('Поиск отменен');
-      break;
-      
-    case 'error':
-      console.error('Ошибка:', message.message);
-      break;
-  }
-};
-
-// Отмена поиска
-function cancelSearch() {
-  matchmaking.send(JSON.stringify({
-    action: 'cancel_search',
-    data: {}
-  }));
-}
-```
-
-## Примечания
-
-1. **Проверка активных игр**: При запросе `find_game` система сначала проверяет наличие активных игр у пользователя. Если найдена активная игра, возвращается `active_game_found` вместо начала нового поиска
-2. **Очередь ожидания**: Игроки добавляются в очередь и проверяются каждые 3 секунды
-3. **Автоматическое создание сессии**: После подбора противника автоматически создается сессия игры
-4. **Уведомления**: Оба игрока получают уведомление о найденной игре через WebSocket
-5. **Отключение**: При отключении от WebSocket игрок автоматически удаляется из очереди
-6. **Автоматическая отмена игры**: Если оба игрока отключились от игрового WebSocket, игра автоматически отменяется
+Все ожидающие игроки находятся в Redis (через `django.core.cache`). Когда новый игрок вызывает `/find/`, бэкенд ищет ему подходящую пару в кэше. Если находит — создает игру и публикует событие в Centrifugo обоим игрокам. Если нет — помещает нового игрока в кэш ждать.

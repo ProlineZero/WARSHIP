@@ -167,12 +167,20 @@ LOGGING = {
         },
     },
     'handlers': {
+        'main_file': {
+            'level': 'INFO',
+            'class': 'concurrent_log_handler.ConcurrentRotatingFileHandler',
+            'filename': os.path.join(BASE_LOG_DIR, 'django.log'),
+            'maxBytes': 100 * 1024 * 1024,  # 100 MB
+            'backupCount': 5,
+            'formatter': 'verbose',
+        },
         'websocket_file': {
             'level': 'INFO',
-            'class': "concurrent_log_handler.ConcurrentRotatingFileHandler",
+            'class': 'concurrent_log_handler.ConcurrentRotatingFileHandler',
             'filename': os.path.join(BASE_LOG_DIR, 'ws_log.log'),
-            'maxBytes': 50 * 1024 * 1024,  # 50 MB
-            'backupCount': 10,  # Максимум 5 файлов
+            'maxBytes': 100 * 1024 * 1024,  # 100 MB
+            'backupCount': 5,
             'formatter': 'verbose',
         },
         'console': {
@@ -182,15 +190,19 @@ LOGGING = {
         },
     },
     'loggers': {
-        "django": {
-            "handlers": ["console"],
-            "level": os.getenv("DJANGO_LOG_LEVEL", "ERROR"),
-            "propagate": False,
+        'django': {
+            'handlers': ['main_file', 'console'],
+            'level': os.getenv('DJANGO_LOG_LEVEL', 'INFO'),
+            'propagate': False,
         },
         'ws_app': {
             'handlers': ['websocket_file', 'console'],
             'level': 'INFO',
             'propagate': False,
+        },
+        '': {
+            'handlers': ['main_file', 'console'],
+            'level': 'INFO',
         },
     },
 }
