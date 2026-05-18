@@ -1,3 +1,4 @@
+import uuid
 from rest_framework import serializers
 
 from core.models.user import User
@@ -37,3 +38,28 @@ class UserBotLoginSerializer(serializers.Serializer):
                 "description": user_bot.description,
             },
         }
+
+class UserBotCreateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = UserBot
+        fields = ["name", "description", "user"]
+
+    def validate_name(self, value: str) -> str:
+        if UserBot.objects.filter(name=value).exists():
+            raise serializers.ValidationError("Имя бота должно быть уникальным.")
+        return value
+
+    def save(self, **kwargs) -> dict:
+        user: User = self.validated_data.pop("user")
+        user_bot = UserBot.objects.create(user=user, **self.validated_data)
+        return {
+            "id": user_bot.id,
+            "name": user_bot.name,
+            "description": user_bot.description,
+            "token": user_bot.token,
+        }
+
+class UserBotSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = UserBot
+        fields = ["id", "name", "description", "token"]

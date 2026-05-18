@@ -10,6 +10,8 @@ from core.serializers.user import (
     UserOTPConfirmSerializer,
     UserOTPRequestSerializer,
     UserPasswordLoginSerializer,
+    UserPasswordResetConfirmSerializer,
+    UserPasswordResetRequestSerializer,
 )
 
 
@@ -47,6 +49,28 @@ class UserPasswordLoginAPIView(APIView):
 
     def post(self, request, *args, **kwargs):
         serializer = UserPasswordLoginSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        payload = serializer.save()
+        return Response(payload, status=status.HTTP_200_OK)
+
+
+class UserPasswordResetRequestAPIView(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request, *args, **kwargs):
+        serializer = UserPasswordResetRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        payload = serializer.save()
+        return Response(payload, status=status.HTTP_200_OK)
+
+
+class UserPasswordResetConfirmAPIView(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request, *args, **kwargs):
+        serializer = UserPasswordResetConfirmSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         payload = serializer.save()
         return Response(payload, status=status.HTTP_200_OK)

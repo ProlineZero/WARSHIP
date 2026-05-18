@@ -143,3 +143,82 @@ class UserPasswordLoginSerializer(serializers.Serializer):
                 "phone": user.phone,
             },
         }
+
+
+class UserPasswordResetRequestSerializer(serializers.Serializer):
+    phone = serializers.CharField(max_length=32)
+
+    def validate_phone(self, value: str) -> str:
+        try:
+            return User._parse_phone_number(value)
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(str(exc)) from exc
+
+    def save(self, **kwargs) -> dict:
+        phone = self.validated_data["phone"]
+
+        user = User.objects.filter(
+            Q(phone=phone) | 
+            Q(username=phone)
+        ).order_by("-id").first()
+        if not user:
+            raise serializers.ValidationError({"phone": "Пользователь с таким номером не найден."})
+
+        if not user.is_active:
+            raise serializers.ValidationError({"phone": "Пользователь деактивирован."})
+
+        message = user.bind_phone(phone=phone)
+        if message.startswith("Ошибка") or message.startswith("Неверный"):
+            raise serializers.ValidationError({"phone": message})
+
+        return {"message": message}
+
+
+class UserPasswordResetConfirmSerializer(serializers.Serializer):
+    phone = serializers.CharField(max_length=32)
+    code = serializers.CharField(max_length=6)
+    password = serializers.CharField(write_only=True, min_length=6)
+
+    def validate_phone(self, value: str) -> str:
+        try:
+            return User._parse_phone_number(value)
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(str(exc)) from exc
+
+    def validate(self, attrs: dict) -> dict:
+        phone = attrs["phone"]
+
+        user = (
+            User.objects.filter(Q(phone=phone) | Q(tmp_phone=phone))
+            .exclude(otp_code__isnull=True)
+            .order_by("-id")
+            .first()
+        )
+        if not user:
+            raise serializers.ValidationError({"phone": "Для этого номера не запрошен OTP-код."})
+
+        attrs["user"] = user
+        return attrs
+
+    def save(self, **kwargs) -> dict:
+        user: User = self.validated_data["user"]
+        code: str = self.validated_data["code"]
+        password: str = self.validated_data["password"]
+
+        success, message = user.bind_phone(phone=user.tmp_phone or user.phone, code=code)
+        if not success:
+            raise serializers.ValidationError({"code": message})
+
+        user.set_password(password)
+        user.save(update_fields=["password"])
+
+        refresh = RefreshToken.for_user(user)
+        return {
+            "access": str(refresh.access_token),
+            "refresh": str(refresh),
+            "message": "Пароль успешно изменён.",
+            "user": {
+                "id": user.id,
+                "phone": user.phone,
+            },
+        }

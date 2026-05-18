@@ -10,7 +10,7 @@ from django.conf import settings
 logger = logging.getLogger('ws_app')
 
 def get_centrifugo_client():
-    api_url = getattr(settings, 'CENTRIFUGO_API_URL', 'http://localhost:8000/api')
+    api_url = getattr(settings, 'CENTRIFUGO_API_URL', 'http://localhost:8001/api')
     api_key = getattr(settings, 'CENTRIFUGO_API_KEY', '')
     return Client(api_url, api_key, timeout=2.0)
 

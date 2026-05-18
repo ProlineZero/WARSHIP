@@ -231,7 +231,7 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 # Channels settings removed
 # Centrifugo configuration
-CENTRIFUGO_API_URL = os.getenv('CENTRIFUGO_API_URL', 'http://localhost:8000/api')
+CENTRIFUGO_API_URL = os.getenv('CENTRIFUGO_API_URL', 'http://localhost:8001/api')
 CENTRIFUGO_API_KEY = os.getenv('CENTRIFUGO_API_KEY', 'default-api-key')
 CENTRIFUGO_HMAC_SECRET_KEY = os.getenv('CENTRIFUGO_HMAC_SECRET_KEY', SECRET_KEY)
 

@@ -1,0 +1,15 @@
+{
+  "http_server": {
+    "address": "0.0.0.0",
+    "port": "8001"
+  },
+  "client": {
+    "allowed_origins": ["*"],
+    "token": {
+      "hmac_secret_key": "change-me"
+    }
+  },
+  "http_api": {
+    "key": "change-me"
+  }
+}
