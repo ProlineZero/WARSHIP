@@ -234,5 +234,25 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 CENTRIFUGO_API_URL = os.getenv('CENTRIFUGO_API_URL', 'http://localhost:8001/api')
 CENTRIFUGO_API_KEY = os.getenv('CENTRIFUGO_API_KEY', 'default-api-key')
 CENTRIFUGO_HMAC_SECRET_KEY = os.getenv('CENTRIFUGO_HMAC_SECRET_KEY', SECRET_KEY)
+CENTRIFUGO_PROXY_SECRET = os.getenv('CENTRIFUGO_PROXY_SECRET', '')
+
+# Presence / автоотмена игры (subscribe + sub_refresh Centrifugo, leave API, sweeper)
+GAME_PRESENCE_TTL = int(os.getenv('GAME_PRESENCE_TTL', '90'))
+GAME_SUBSCRIPTION_EXPIRE_SECONDS = int(os.getenv('GAME_SUBSCRIPTION_EXPIRE_SECONDS', '60'))
+GAME_CANCEL_GRACE_SECONDS = int(os.getenv('GAME_CANCEL_GRACE_SECONDS', '60'))
+GAME_STALE_TIMEOUT_SECONDS = int(os.getenv('GAME_STALE_TIMEOUT_SECONDS', '7200'))
+
+# В Docker задаётся REDIS_URL (matchmaking, presence). Без него — LocMem.
+_redis_url = os.getenv('REDIS_URL')
+CACHES = {
+    'default': {
+        'BACKEND': (
+            'django.core.cache.backends.redis.RedisCache'
+            if _redis_url
+            else 'django.core.cache.backends.locmem.LocMemCache'
+        ),
+        'LOCATION': _redis_url or 'warship-default',
+    }
+}
 
 Path(BASE_LOG_DIR).mkdir(parents=True, exist_ok=True)

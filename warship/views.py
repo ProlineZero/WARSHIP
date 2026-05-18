@@ -14,6 +14,11 @@ from core.models.user import User
 from warship.models import GameSession, ShipPlacement, GameMove
 from warship.matchmaking import find_opponent_from_queue
 from warship.centrifugo import publish_to_game, publish_to_user, generate_centrifugo_token
+from warship.game_presence import (
+    clear_presence,
+    touch_presence_for_active_game,
+    try_cancel_game_if_abandoned,
+)
 
 logger = logging.getLogger('ws_app')
 
@@ -243,14 +248,47 @@ def broadcast_game_status(game_session):
     })
 
 
+def _get_participant_game(request, game_id, *, touch_presence=True):
+    game_session = GameSession.objects.filter(id=game_id).select_related('player1', 'player2').first()
+    if not game_session:
+        return None, Response({'error': 'Игра не найдена'}, status=404)
+    participant_ids = [game_session.player1_id]
+    if game_session.player2_id:
+        participant_ids.append(game_session.player2_id)
+    if request.user.id not in participant_ids:
+        return None, Response({'error': 'Вы не участник этой игры'}, status=403)
+    if touch_presence:
+        touch_presence_for_active_game(game_session, request.user.id)
+    return game_session, None
+
+
+class GameLeaveAPIView(APIView):
+    """Явный выход из игры (ускоряет отмену при уходе обоих)."""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, game_id):
+        game_session, error_response = _get_participant_game(request, game_id, touch_presence=False)
+        if error_response:
+            return error_response
+
+        clear_presence(game_id, request.user.id)
+        try_cancel_game_if_abandoned(game_id)
+
+        return Response({
+            'action': 'game_left',
+            'status': 'success',
+            'message': 'Вы вышли из игры',
+        })
+
+
 class GameStatusAPIView(APIView):
     """Получение статуса игры"""
     permission_classes = [IsAuthenticated]
     
     def get(self, request, game_id):
-        game_session = GameSession.objects.filter(id=game_id).first()
-        if not game_session:
-            return Response({'error': 'Игра не найдена'}, status=404)
+        game_session, error_response = _get_participant_game(request, game_id)
+        if error_response:
+            return error_response
         
         return Response({
             'action': 'game_status',
@@ -264,9 +302,9 @@ class GameBoardAPIView(APIView):
     permission_classes = [IsAuthenticated]
     
     def get(self, request, game_id):
-        game_session = GameSession.objects.filter(id=game_id).first()
-        if not game_session:
-            return Response({'error': 'Игра не найдена'}, status=404)
+        game_session, error_response = _get_participant_game(request, game_id)
+        if error_response:
+            return error_response
             
         my_placement = ShipPlacement.objects.filter(
             game_session=game_session,
@@ -306,9 +344,9 @@ class GamePlaceShipsAPIView(APIView):
         if not ships_data:
             return Response({'error': 'Не указаны корабли для размещения'}, status=400)
             
-        game_session = GameSession.objects.filter(id=game_id).first()
-        if not game_session:
-            return Response({'error': 'Игра не найдена'}, status=404)
+        game_session, error_response = _get_participant_game(request, game_id)
+        if error_response:
+            return error_response
             
         if game_session.status != GameSession.GameStatus.WAITING_SHIPS:
             return Response({'error': 'Игра уже начата, нельзя размещать корабли'}, status=400)
@@ -370,9 +408,9 @@ class GameMakeShotAPIView(APIView):
         if row is None or col is None:
             return Response({'error': 'Не указаны координаты выстрела (row, col)'}, status=400)
             
-        game_session = GameSession.objects.filter(id=game_id).first()
-        if not game_session:
-            return Response({'error': 'Игра не найдена'}, status=404)
+        game_session, error_response = _get_participant_game(request, game_id)
+        if error_response:
+            return error_response
             
         if game_session.status == GameSession.GameStatus.WAITING_SHIPS:
             return Response({'error': 'Игра еще не начата'}, status=400)

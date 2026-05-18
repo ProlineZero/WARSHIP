@@ -27,3 +27,4 @@ django-cors-headers==4.2.0
 uvicorn==0.37.0
 concurrent-log-handler==0.9.28
 cent==5.2.0
+redis==5.2.1

@@ -1,4 +1,10 @@
 {
+  "engine": {
+    "type": "redis",
+    "redis": {
+      "address": "redis://redis:6379"
+    }
+  },
   "http_server": {
     "address": "0.0.0.0",
     "port": "8001"
@@ -11,5 +17,29 @@
   },
   "http_api": {
     "key": "change-me"
+  },
+  "channel": {
+    "proxy": {
+      "subscribe": {
+        "endpoint": "http://web:8000/api/warship/centrifugo/proxy/subscribe/",
+        "http": {
+          "static_headers": {
+            "X-Centrifugo-Proxy-Key": "dev-proxy-secret"
+          }
+        }
+      },
+      "sub_refresh": {
+        "endpoint": "http://web:8000/api/warship/centrifugo/proxy/sub_refresh/",
+        "http": {
+          "static_headers": {
+            "X-Centrifugo-Proxy-Key": "dev-proxy-secret"
+          }
+        }
+      }
+    },
+    "without_namespace": {
+      "subscribe_proxy_enabled": true,
+      "sub_refresh_proxy_enabled": true
+    }
   }
 }
