@@ -6,42 +6,8 @@ from django.db.models.functions import Coalesce
 from warship.models import GameSession
 from django.conf import settings
 import logging
-
+from warship.utils import get_player_stats
 logger = logging.getLogger('ws_app')
-
-
-def get_player_stats(user):
-    """
-    Получает статистику игрока.
-    
-    Args:
-        user: Пользователь
-    
-    Returns:
-        dict с ключами:
-        - total_games: общее количество завершенных игр
-        - wins: количество побед
-        - win_rate: процент побед (0-100)
-    """
-    # Подсчитываем завершенные игры, где игрок участвовал
-    finished_games = GameSession.objects.filter(
-        Q(player1=user) | Q(player2=user),
-        status=GameSession.GameStatus.FINISHED
-    )
-    
-    total_games = finished_games.count()
-    
-    # Подсчитываем победы
-    wins = finished_games.filter(winner=user).count()
-    
-    # Рассчитываем процент побед
-    win_rate = (wins / total_games * 100) if total_games > 0 else 50.0
-    
-    return {
-        'total_games': total_games,
-        'wins': wins,
-        'win_rate': round(win_rate, 2)
-    }
 
 
 def find_opponent_from_queue(user, waiting_queue_dict, max_skill_diff=20, max_games_diff=50):

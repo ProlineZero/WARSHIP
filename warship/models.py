@@ -27,6 +27,7 @@ class GameSession(models.Model):
     """
     
     class GameStatus(models.TextChoices):
+        WAITING_CHALLENGE = 'waiting_challenge', 'Ожидание вызова'
         WAITING_SHIPS = 'waiting_ships', 'Ожидание размещения кораблей'
         PLAYER1_TURN = 'player1_turn', 'Ход первого игрока'
         PLAYER2_TURN = 'player2_turn', 'Ход второго игрока'
@@ -48,6 +49,11 @@ class GameSession(models.Model):
         blank=True
     )
     
+    is_training = models.BooleanField(
+        default=False,
+        verbose_name='Тренировка'
+    )
+
     status = models.CharField(
         max_length=20,
         choices=GameStatus.choices,
@@ -118,6 +124,10 @@ class GameSession(models.Model):
     
     def finish_game(self, winner):
         """Завершает игру и устанавливает победителя."""
+        
+        from warship.utils import get_player_stats
+
+
         if self.status == self.GameStatus.FINISHED:
             raise ValidationError('Игра уже завершена')
         
@@ -128,6 +138,10 @@ class GameSession(models.Model):
         self.winner = winner
         self.current_turn = None
         self.finished_at = timezone.now()
+        self.player1.metadata['stats'] = get_player_stats(self.player1)
+        self.player1.save()
+        self.player2.metadata['stats'] = get_player_stats(self.player2)
+        self.player2.save()
         self.save()
     
     def cancel_game(self):

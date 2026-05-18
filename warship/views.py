@@ -3,11 +3,14 @@ from django.utils import timezone
 from django.core.cache import cache
 from django.db.models import Q
 from rest_framework import status
+from rest_framework.request import Request
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from django.core.exceptions import ValidationError
 
+from core.auth.bot_access import is_bot_request
+from core.models.user import User
 from warship.models import GameSession, ShipPlacement, GameMove
 from warship.matchmaking import find_opponent_from_queue
 from warship.centrifugo import publish_to_game, publish_to_user, generate_centrifugo_token
@@ -27,7 +30,7 @@ class MatchmakingFindAPIView(APIView):
     """Запрос на поиск игры"""
     permission_classes = [IsAuthenticated]
     
-    def get_active_game_data(self, user):
+    def get_active_game_data(self, user: User):
         try:
             active_game = GameSession.objects.select_related(
                 'player1', 'player2', 'current_turn'
@@ -68,9 +71,12 @@ class MatchmakingFindAPIView(APIView):
             logger.error(f"Ошибка при получении активной игры для пользователя {user.id}: {e}")
             return None
 
-    def post(self, request):
-        user = request.user
-        
+    def post(self, request: Request):
+        user: User = request.user
+        is_training = False
+        if is_bot_request(request):
+            is_training = request.data.get('is_training', True)
+
         # Проверяем наличие активных игр
         active_game_data = self.get_active_game_data(user)
         if active_game_data:
@@ -89,7 +95,7 @@ class MatchmakingFindAPIView(APIView):
         if opponent:
             # Проверяем не создана ли уже игра
             existing_game = GameSession.objects.filter(
-                Q(player1=user, player2=opponent) | Q(player1=opponent, player2=user)
+                Q(player1=user, player2=opponent) | Q(player1=opponent, player2=user), is_training=is_training
             ).exclude(
                 status__in=[GameSession.GameStatus.FINISHED, GameSession.GameStatus.CANCELLED]
             ).first()
@@ -100,7 +106,8 @@ class MatchmakingFindAPIView(APIView):
                 game_session = GameSession.objects.create(
                     player1=user,
                     player2=opponent,
-                    status=GameSession.GameStatus.WAITING_SHIPS
+                    status=GameSession.GameStatus.WAITING_SHIPS,
+                    is_training=is_training
                 )
             
             # Удаляем из очереди
@@ -414,3 +421,31 @@ class GameMakeShotAPIView(APIView):
             'status': 'success',
             'data': result_to_send
         })
+
+
+# Апи для того чтобы бросить вызов другому игроку
+class GameChallengeAPIView(APIView):
+    """Бросить вызов другому игроку"""
+    permission_classes = [IsAuthenticated]
+    
+    def post(self, request):
+        opponent_id = request.data.get('opponent_id')
+        if not opponent_id:
+            return Response({'error': 'Не указан ID противника'}, status=400)
+        opponent: User = User.objects.filter(id=opponent_id).first()
+        if not opponent:
+            return Response({'error': 'Игрок не найден'}, status=404)
+        
+        challenge_data = {
+            "action": "challenge_created",
+            "opponent": {
+                'id': opponent.id,
+                'username': opponent.username,
+                'stats': opponent.metadata['stats'],
+            },
+        }
+
+        game_session = GameSession.objects.create(
+            is_training=True
+        )
+

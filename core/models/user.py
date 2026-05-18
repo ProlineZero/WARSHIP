@@ -39,6 +39,7 @@ class User(AbstractUser):
     otp_code = models.CharField(max_length=6, null=True, blank=True)
     otp_expiry = models.DateTimeField(null=True, blank=True)
 
+    metadata = models.JSONField(default=dict, blank=True)
 
     @staticmethod
     def _parse_phone_number(phone_str: str) -> (str):
