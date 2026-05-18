@@ -4,6 +4,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.views import TokenRefreshView
 
+from core.auth.bot_access import BotAccessMixin, deny_bot
 from core.serializers.me import UserMeConfirmPhoneSerializer, UserMeSerializer, UserMeUpdateSerializer
 from core.serializers.user import (
     UserOTPConfirmSerializer,
@@ -56,12 +57,13 @@ class UserJWTRefreshAPIView(TokenRefreshView):
     authentication_classes = []
 
 
-class UserMeAPIView(APIView):
+class UserMeAPIView(BotAccessMixin, APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request, *args, **kwargs):
         return Response(UserMeSerializer(request.user).data, status=status.HTTP_200_OK)
 
+    @deny_bot
     def put(self, request, *args, **kwargs):
         serializer = UserMeUpdateSerializer(
             instance=request.user,
@@ -74,9 +76,10 @@ class UserMeAPIView(APIView):
         return Response(payload, status=status.HTTP_200_OK)
 
 
-class UserMeConfirmPhoneAPIView(APIView):
+class UserMeConfirmPhoneAPIView(BotAccessMixin, APIView):
     permission_classes = [IsAuthenticated]
 
+    @deny_bot
     def post(self, request, *args, **kwargs):
         serializer = UserMeConfirmPhoneSerializer(data=request.data, context={"request": request})
         serializer.is_valid(raise_exception=True)
