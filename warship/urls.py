@@ -6,7 +6,10 @@ urlpatterns = [
     # Matchmaking
     path('matchmaking/find/', views.MatchmakingFindAPIView.as_view(), name='matchmaking-find'),
     path('matchmaking/cancel/', views.MatchmakingCancelAPIView.as_view(), name='matchmaking-cancel'),
-    
+
+    path('challenge/', views.GameChallengeAPIView.as_view(), name='game-challenge'),
+    path('game/<int:game_id>/accept_challenge/', views.accept_challenge, name='game-accept-challenge'),
+
     # Game actions
     path('game/<int:game_id>/status/', views.GameStatusAPIView.as_view(), name='game-status'),
     path('game/<int:game_id>/board/', views.GameBoardAPIView.as_view(), name='game-board'),

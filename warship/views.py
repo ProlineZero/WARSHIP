@@ -1,4 +1,5 @@
 import logging
+from rest_framework.decorators import api_view
 from django.utils import timezone
 from django.core.cache import cache
 from django.db.models import Q
@@ -141,6 +142,7 @@ class MatchmakingFindAPIView(APIView):
             publish_to_user(game_session.player2.id, {
                 'action': 'game_found',
                 'status': 'success',
+                'game_status': game_session.status,
                 'data': {
                     'opponent': {'id': game_session.player1.id, 'username': game_session.player1.username},
                     **message_data_base
@@ -470,20 +472,85 @@ class GameChallengeAPIView(APIView):
         opponent_id = request.data.get('opponent_id')
         if not opponent_id:
             return Response({'error': 'Не указан ID противника'}, status=400)
+
         opponent: User = User.objects.filter(id=opponent_id).first()
         if not opponent:
             return Response({'error': 'Игрок не найден'}, status=404)
         
-        challenge_data = {
-            "action": "challenge_created",
-            "opponent": {
-                'id': opponent.id,
-                'username': opponent.username,
-                'stats': opponent.metadata['stats'],
-            },
-        }
+        user = request.user
+        if user.id == opponent_id:
+            return Response({'error': 'Вы не можете бросить вызов себе'}, status=400)
 
         game_session = GameSession.objects.create(
+            player1=user,
+            player2=opponent,
+            status=GameSession.GameStatus.WAITING_CHALLENGE,
             is_training=True
         )
 
+        challenge_data = {
+            "action": "challenge_created",
+            "game_id": game_session.id,
+            "game_status": game_session.status,
+            "opponent": {
+                'id': user.id,
+                'username': user.username,
+                'stats': user.metadata.get('stats', {}),
+            },
+        }
+        publish_to_user(opponent.id, challenge_data)
+        
+        # Уведомляем обоих игроков через Centrifugo
+        message_data_base = {
+            'game_id': game_session.id,
+            'status': 'success',
+            'game_status': game_session.status,
+            'player1': {'id': game_session.player1.id, 'username': game_session.player1.username},
+            'player2': {'id': game_session.player2.id, 'username': game_session.player2.username}
+        }
+        
+        # Уведомление первому
+        publish_to_user(user.id, {
+            'action': 'game_found',
+            'status': 'success',
+            'data': {
+                'opponent': {'id': game_session.player2.id, 'username': game_session.player2.username},
+                **message_data_base
+            }
+        })
+        return Response(message_data_base)
+
+@api_view(['POST'])
+def accept_challenge(request, game_id):
+    game_session: GameSession | None = GameSession.objects.filter(id=game_id).first()
+    if not game_session:
+        return Response({'error': 'Игра не найдена'}, status=404)
+    if game_session.status != GameSession.GameStatus.WAITING_CHALLENGE:
+        return Response({'error': 'Игра не находится в состоянии ожидания вызова'}, status=400)
+    if game_session.player1_id != request.user.id and game_session.player2_id != request.user.id:
+        return Response({'error': 'Вы не участник этой игры'}, status=403)
+    game_session.status = GameSession.GameStatus.WAITING_SHIPS
+    game_session.save()
+    user = request.user
+    opponent = game_session.get_opponent(user)
+    
+    message_data_base = {
+        'game_id': game_session.id,
+        'status': 'success',
+        'game_status': game_session.status,
+        'player1': {'id': game_session.player1.id, 'username': game_session.player1.username},
+        'player2': {'id': game_session.player2.id, 'username': game_session.player2.username}
+    }
+    for player in (user, opponent):
+        publish_to_user(player.id, {
+            'action': 'game_found',
+            'status': 'success',
+            'data': {
+                'opponent': {
+                    'id': opponent.id if player == user else user.id,
+                    'username': opponent.username if player == user else user.username,
+                },
+                **message_data_base
+            }
+        })
+    return Response({'message': 'Вызов принят'})
