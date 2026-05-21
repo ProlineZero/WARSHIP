@@ -5,6 +5,7 @@ import hmac
 import hashlib
 import time
 from cent import Client
+from cent.dto import PublishRequest
 from django.conf import settings
 
 logger = logging.getLogger('ws_app')
@@ -19,7 +20,7 @@ def publish_to_game(game_id, message):
     channel = f"game_{game_id}"
     logger.info(f"[CENTRIFUGO] Публикация в канал {channel}: {message}")
     try:
-        client.publish(channel, message)
+        client.publish(PublishRequest(channel=channel, data=message))
     except Exception as e:
         logger.error(f"[CENTRIFUGO] Ошибка публикации в {channel}: {e}", exc_info=True)
 
@@ -28,7 +29,7 @@ def publish_to_user(user_id, message):
     channel = f"user_{user_id}"
     logger.info(f"[CENTRIFUGO] Публикация пользователю {channel}: {message}")
     try:
-        client.publish(channel, message)
+        client.publish(PublishRequest(channel=channel, data=message))
     except Exception as e:
         logger.error(f"[CENTRIFUGO] Ошибка публикации пользователю {user_id}: {e}", exc_info=True)
 

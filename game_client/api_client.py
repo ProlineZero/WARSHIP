@@ -43,13 +43,28 @@ class WarshipApiClient:
             raise ApiError(str(error), response.status_code, data)
         return data
 
-    def login(self, login: str, password: str) -> dict:
-        payload = self._request('POST', '/auth/login/', json={'login': login, 'password': password})
+    def _apply_auth(self, payload: dict) -> None:
         self.access_token = payload['access']
         self.refresh_token = payload.get('refresh')
         me = self.get_me()
         self.user_id = me['id']
         self.username = me.get('username') or str(me.get('phone') or me['id'])
+
+    def login(self, login: str, password: str) -> dict:
+        payload = self._request('POST', '/auth/login/', json={'login': login, 'password': password})
+        self._apply_auth(payload)
+        return payload
+
+    def register_request_otp(self, phone: str) -> dict:
+        return self._request('POST', '/auth/register/request-otp/', json={'phone': phone})
+
+    def register_confirm_otp(self, phone: str, code: str, password: str) -> dict:
+        payload = self._request(
+            'POST',
+            '/auth/register/confirm-otp/',
+            json={'phone': phone, 'code': code, 'password': password},
+        )
+        self._apply_auth(payload)
         return payload
 
     def get_me(self) -> dict:

@@ -1,4 +1,3 @@
-from django.conf import settings
 from django.core.exceptions import ValidationError as DjangoValidationError
 from rest_framework import serializers
 
@@ -9,12 +8,14 @@ def get_user_model():
     return django_get_user_model()
 
 
+User = get_user_model()
+
+
 class UserMeSerializer(serializers.ModelSerializer):
     phone_pending = serializers.SerializerMethodField()
 
     class Meta:
-        # Используем строковую ссылку на модель для избежания проблем с импортом
-        model = settings.AUTH_USER_MODEL
+        model = User
         fields = (
             "id",
             "phone",
@@ -34,8 +35,7 @@ class UserMeUpdateSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True, required=False, allow_blank=True)
 
     class Meta:
-        # Используем строковую ссылку на модель для избежания проблем с импортом
-        model = settings.AUTH_USER_MODEL
+        model = User
         fields = (
             "username",
             "first_name",

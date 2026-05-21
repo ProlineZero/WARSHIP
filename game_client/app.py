@@ -104,28 +104,51 @@ class WarshipClientApp:
         self._searching = False
         self._refresh_timer: str | None = None
 
-        self._build_login()
+        self._build_auth()
         self._show_login()
 
-    def _build_login(self):
+    def _build_auth(self):
         self.login_frame = ttk.Frame(self.root, padding=16)
-        ttk.Label(self.login_frame, text='Вход', font=('Segoe UI', 16, 'bold')).pack(anchor='w')
-        form = ttk.Frame(self.login_frame)
-        form.pack(fill='x', pady=12)
+        ttk.Label(self.login_frame, text='Warship', font=('Segoe UI', 16, 'bold')).pack(anchor='w')
 
+        settings = ttk.Frame(self.login_frame)
+        settings.pack(fill='x', pady=(8, 4))
         self.api_url_var = tk.StringVar(value=API_BASE_URL)
         self.ws_url_var = tk.StringVar(value=CENTRIFUGO_WS_URL)
+        self._add_field(settings, 'API URL', self.api_url_var)
+        self._add_field(settings, 'Centrifugo WS', self.ws_url_var)
+
+        notebook = ttk.Notebook(self.login_frame)
+        notebook.pack(fill='both', expand=True, pady=8)
+
+        login_tab = ttk.Frame(notebook, padding=8)
+        register_tab = ttk.Frame(notebook, padding=8)
+        notebook.add(login_tab, text='Вход')
+        notebook.add(register_tab, text='Регистрация')
+
         self.login_var = tk.StringVar()
         self.password_var = tk.StringVar()
-
-        self._add_field(form, 'API URL', self.api_url_var)
-        self._add_field(form, 'Centrifugo WS', self.ws_url_var)
-        self._add_field(form, 'Логин (username / телефон)', self.login_var)
-        self._add_field(form, 'Пароль', self.password_var, show='*')
-
-        self.login_status = ttk.Label(self.login_frame, text='')
+        self._add_field(login_tab, 'Логин (username / телефон)', self.login_var)
+        self._add_field(login_tab, 'Пароль', self.password_var, show='*')
+        self.login_status = ttk.Label(login_tab, text='')
         self.login_status.pack(anchor='w', pady=4)
-        ttk.Button(self.login_frame, text='Войти', command=self._do_login).pack(anchor='w')
+        ttk.Button(login_tab, text='Войти', command=self._do_login).pack(anchor='w')
+
+        self.register_phone_var = tk.StringVar()
+        self.register_code_var = tk.StringVar()
+        self.register_password_var = tk.StringVar()
+        self._add_field(register_tab, 'Телефон (+7...)', self.register_phone_var)
+        ttk.Button(register_tab, text='Получить SMS-код', command=self._do_request_otp).pack(anchor='w', pady=4)
+        self._add_field(register_tab, 'Код из SMS', self.register_code_var)
+        self._add_field(register_tab, 'Пароль (мин. 6 символов)', self.register_password_var, show='*')
+        self.register_status = ttk.Label(register_tab, text='')
+        self.register_status.pack(anchor='w', pady=4)
+        ttk.Button(register_tab, text='Зарегистрироваться', command=self._do_register).pack(anchor='w')
+        ttk.Label(
+            register_tab,
+            text='После регистрации входите тем же телефоном и паролем.',
+            foreground='gray',
+        ).pack(anchor='w', pady=(8, 0))
 
     def _add_field(self, parent, label, variable, show=None):
         row = ttk.Frame(parent)
@@ -256,6 +279,55 @@ class WarshipClientApp:
                 self._ui(self.login_status.config, text=str(exc), foreground='red')
             except Exception as exc:
                 self._ui(self.login_status.config, text=str(exc), foreground='red')
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _do_request_otp(self):
+        phone = self.register_phone_var.get().strip()
+        if not phone:
+            self.register_status.config(text='Введите номер телефона', foreground='red')
+            return
+        self.api.base_url = self.api_url_var.get().strip().rstrip('/')
+        self.register_status.config(text='Отправка кода...', foreground='gray')
+
+        def work():
+            try:
+                result = self.api.register_request_otp(phone)
+                msg = result.get('message', 'Код отправлен')
+                if result.get('is_new_user'):
+                    msg += ' (новый пользователь)'
+                self._ui(self.register_status.config, text=msg, foreground='green')
+            except ApiError as exc:
+                self._ui(self.register_status.config, text=str(exc), foreground='red')
+            except Exception as exc:
+                self._ui(self.register_status.config, text=str(exc), foreground='red')
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _do_register(self):
+        phone = self.register_phone_var.get().strip()
+        code = self.register_code_var.get().strip()
+        password = self.register_password_var.get()
+        if not phone or not code:
+            self.register_status.config(text='Укажите телефон и код', foreground='red')
+            return
+        if len(password) < 6:
+            self.register_status.config(text='Пароль не короче 6 символов', foreground='red')
+            return
+        self.api.base_url = self.api_url_var.get().strip().rstrip('/')
+        self.register_status.config(text='Регистрация...', foreground='gray')
+
+        def work():
+            try:
+                self.api.register_confirm_otp(phone, code, password)
+                ws_url = self.ws_url_var.get().strip()
+                self._start_realtime(ws_url)
+                self._ui(self._on_login_ok)
+                self._ui(self.register_status.config, text='Успешно', foreground='green')
+            except ApiError as exc:
+                self._ui(self.register_status.config, text=str(exc), foreground='red')
+            except Exception as exc:
+                self._ui(self.register_status.config, text=str(exc), foreground='red')
 
         threading.Thread(target=work, daemon=True).start()
 
