@@ -19,6 +19,8 @@ class WarshipApiClient:
         self.refresh_token: str | None = None
         self.user_id: int | None = None
         self.username: str | None = None
+        self.is_bot: bool = False
+        self.user_bot: dict | None = None
 
     def _headers(self) -> dict:
         headers = {'Content-Type': 'application/json'}
@@ -44,11 +46,22 @@ class WarshipApiClient:
         return data
 
     def _apply_auth(self, payload: dict) -> None:
+        self.is_bot = False
+        self.user_bot = None
         self.access_token = payload['access']
         self.refresh_token = payload.get('refresh')
         me = self.get_me()
         self.user_id = me['id']
         self.username = me.get('username') or str(me.get('phone') or me['id'])
+
+    def _apply_bot_auth(self, payload: dict) -> None:
+        self.is_bot = True
+        self.user_bot = payload.get('user_bot')
+        self.access_token = payload['access']
+        self.refresh_token = payload.get('refresh')
+        me = self.get_me()
+        self.user_id = me['id']
+        self.username = self.user_bot['name'] if self.user_bot else str(me['id'])
 
     def login(self, login: str, password: str) -> dict:
         payload = self._request('POST', '/auth/login/', json={'login': login, 'password': password})
@@ -70,11 +83,31 @@ class WarshipApiClient:
     def get_me(self) -> dict:
         return self._request('GET', '/user/me/')
 
+    def bot_login(self, token: str) -> dict:
+        payload = self._request('POST', '/auth/bot/login/', json={'token': token})
+        self._apply_bot_auth(payload)
+        return payload
+
+    def list_bots(self) -> list:
+        return self._request('GET', '/user/me/bots/')
+
+    def create_bot(self, name: str, description: str = '') -> dict:
+        body = {'name': name}
+        if description:
+            body['description'] = description
+        return self._request('POST', '/user/me/bots/', json=body)
+
+    def delete_bot(self, bot_id: int) -> None:
+        self._request('DELETE', f'/user/me/bots/{bot_id}/')
+
     def get_centrifugo_token(self) -> str:
         return self._request('GET', '/warship/centrifugo/token/')['token']
 
-    def matchmaking_find(self) -> dict:
-        return self._request('POST', '/warship/matchmaking/find/', json={})
+    def matchmaking_find(self, is_training: bool | None = None) -> dict:
+        body: dict = {}
+        if is_training is not None:
+            body['is_training'] = is_training
+        return self._request('POST', '/warship/matchmaking/find/', json=body)
 
     def matchmaking_cancel(self) -> dict:
         return self._request('POST', '/warship/matchmaking/cancel/', json={})

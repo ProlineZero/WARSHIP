@@ -613,17 +613,6 @@ def make_shot(game_session: GameSession, player, row: int, col: int) -> dict:
     
     hit_result = opponent_placement.check_hit(row, col)
     
-    # Создаем запись о ходе
-    move = GameMove.objects.create(
-        game_session=game_session,
-        player=player,
-        row=row,
-        col=col,
-        hit=hit_result['hit'],
-        ship_destroyed=hit_result['ship_destroyed'],
-        ship_size=hit_result.get('ship_size')
-    )
-    
     # Проверяем, завершена ли игра
     game_finished = False
     winner = None
@@ -644,5 +633,4 @@ def make_shot(game_session: GameSession, player, row: int, col: int) -> dict:
         'ship_size': hit_result.get('ship_size'),
         'game_finished': game_finished,
         'winner': winner,
-        'move_id': move.id
     }

@@ -1,0 +1,14 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+COPY game_client/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY game_client/ .
+
+# В контейнере нет GUI — монитор отключён по умолчанию в docker-compose
+CMD ["python", "run_load_test.py", "--no-monitor"]

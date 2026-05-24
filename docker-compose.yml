@@ -1,6 +1,16 @@
 services:
   db:
     image: postgres:16-alpine
+    command:
+      - postgres
+      - -c
+      - max_connections=${POSTGRES_MAX_CONNECTIONS:-2000}
+      - -c
+      - shared_buffers=${POSTGRES_SHARED_BUFFERS:-512MB}
+      - -c
+      - work_mem=${POSTGRES_WORK_MEM:-2MB}
+      - -c
+      - effective_cache_size=${POSTGRES_EFFECTIVE_CACHE_SIZE:-2GB}
     environment:
       POSTGRES_DB: ${DB_NAME:-warship_db}
       POSTGRES_USER: ${DB_USER:-postgres}
@@ -9,6 +19,30 @@ services:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-warship_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  pgbouncer:
+    image: edoburu/pgbouncer:v1.24.1-p1
+    environment:
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_USER: ${DB_USER:-postgres}
+      DB_PASSWORD: ${DB_PASSWORD:-postgres}
+      DB_NAME: ${DB_NAME:-warship_db}
+      POOL_MODE: transaction
+      AUTH_TYPE: scram-sha-256
+      MAX_CLIENT_CONN: ${PGBOUNCER_MAX_CLIENT_CONN:-10000}
+      DEFAULT_POOL_SIZE: ${PGBOUNCER_DEFAULT_POOL_SIZE:-200}
+      RESERVE_POOL_SIZE: ${PGBOUNCER_RESERVE_POOL_SIZE:-25}
+      MAX_DB_CONNECTIONS: ${PGBOUNCER_DEFAULT_POOL_SIZE:-200}
+      SERVER_RESET_QUERY: DISCARD ALL
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h localhost -p 5432 -U ${DB_USER:-postgres} -d ${DB_NAME:-warship_db}"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -47,16 +81,37 @@ services:
     env_file:
       - .env
     environment:
-      DB_HOST: db
+      DB_HOST: pgbouncer
       DB_PORT: 5432
       REDIS_URL: redis://redis:6379/0
       CENTRIFUGO_API_URL: http://centrifugo:8001/api
       CENTRIFUGO_PROXY_SECRET: ${CENTRIFUGO_PROXY_SECRET:-dev-proxy-secret}
+    volumes:
+      - ./core:/app/core
+      - ./game_client/load_test:/app/game_client/load_test
     depends_on:
-      db:
+      pgbouncer:
         condition: service_healthy
       redis:
         condition: service_healthy
+      centrifugo:
+        condition: service_started
+
+  loadtest:
+    profiles: [loadtest]
+    build:
+      context: .
+      dockerfile: game_client/Dockerfile.loadtest
+    env_file:
+      - .env
+    environment:
+      WARSHIP_API_URL: http://web:8000/api
+      WARSHIP_CENTRIFUGO_WS: ws://centrifugo:8001/connection/websocket
+    volumes:
+      - ./game_client/load_test:/app/load_test
+    depends_on:
+      web:
+        condition: service_started
       centrifugo:
         condition: service_started
 

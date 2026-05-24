@@ -1,3 +1,4 @@
 **log
 **.lock
 **__pycache__
+game_client/load_test/accounts.json

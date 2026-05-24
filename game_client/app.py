@@ -150,6 +150,14 @@ class WarshipClientApp:
             foreground='gray',
         ).pack(anchor='w', pady=(8, 0))
 
+        bot_tab = ttk.Frame(notebook, padding=8)
+        notebook.add(bot_tab, text='Бот')
+        self.bot_token_var = tk.StringVar()
+        self._add_field(bot_tab, 'Токен бота (UUID)', self.bot_token_var)
+        self.bot_login_status = ttk.Label(bot_tab, text='')
+        self.bot_login_status.pack(anchor='w', pady=4)
+        ttk.Button(bot_tab, text='Войти как бот', command=self._do_bot_login).pack(anchor='w')
+
     def _add_field(self, parent, label, variable, show=None):
         row = ttk.Frame(parent)
         row.pack(fill='x', pady=4)
@@ -164,13 +172,24 @@ class WarshipClientApp:
         self.user_label.pack(side='left')
         ttk.Button(top, text='Выйти', command=self._logout).pack(side='right')
 
-        actions = ttk.LabelFrame(self.lobby_frame, text='Действия', padding=8)
-        actions.pack(fill='x', pady=8)
+        self.lobby_notebook = ttk.Notebook(self.lobby_frame)
+        self.lobby_notebook.pack(fill='both', expand=True, pady=8)
+
+        game_tab = ttk.Frame(self.lobby_notebook, padding=4)
+        self.lobby_notebook.add(game_tab, text='Игра')
+
+        actions = ttk.LabelFrame(game_tab, text='Действия', padding=8)
+        actions.pack(fill='x', pady=4)
 
         mm = ttk.Frame(actions)
         mm.pack(fill='x', pady=4)
         ttk.Button(mm, text='Найти игру (матчмейкинг)', command=self._matchmaking_find).pack(side='left', padx=4)
         ttk.Button(mm, text='Отменить поиск', command=self._matchmaking_cancel).pack(side='left', padx=4)
+        self.training_match_var = tk.BooleanVar(value=True)
+        self.training_check = ttk.Checkbutton(
+            mm, text='Тренировочный матч', variable=self.training_match_var,
+        )
+        self.training_check.pack(side='left', padx=8)
 
         ch = ttk.Frame(actions)
         ch.pack(fill='x', pady=4)
@@ -179,8 +198,44 @@ class WarshipClientApp:
         ttk.Entry(ch, textvariable=self.opponent_id_var, width=10).pack(side='left', padx=4)
         ttk.Button(ch, text='Бросить вызов', command=self._send_challenge).pack(side='left', padx=4)
 
-        self.log = scrolledtext.ScrolledText(self.lobby_frame, height=22, state='disabled')
+        self.log = scrolledtext.ScrolledText(game_tab, height=22, state='disabled')
         self.log.pack(fill='both', expand=True, pady=8)
+
+        bots_tab = ttk.Frame(self.lobby_notebook, padding=8)
+        self.bots_tab = bots_tab
+        self.lobby_notebook.add(bots_tab, text='Мои боты')
+
+        bot_toolbar = ttk.Frame(bots_tab)
+        bot_toolbar.pack(fill='x', pady=4)
+        ttk.Button(bot_toolbar, text='Обновить', command=self._refresh_bots).pack(side='left', padx=4)
+        ttk.Button(bot_toolbar, text='Создать', command=self._create_bot).pack(side='left', padx=4)
+        ttk.Button(bot_toolbar, text='Удалить', command=self._delete_bot).pack(side='left', padx=4)
+        ttk.Button(bot_toolbar, text='Копировать токен', command=self._copy_bot_token).pack(side='left', padx=4)
+
+        create_frame = ttk.LabelFrame(bots_tab, text='Новый бот', padding=8)
+        create_frame.pack(fill='x', pady=4)
+        self.new_bot_name_var = tk.StringVar()
+        self.new_bot_desc_var = tk.StringVar()
+        self._add_field(create_frame, 'Имя', self.new_bot_name_var)
+        self._add_field(create_frame, 'Описание', self.new_bot_desc_var)
+
+        tree_frame = ttk.Frame(bots_tab)
+        tree_frame.pack(fill='both', expand=True, pady=4)
+        columns = ('id', 'name', 'description', 'token')
+        self.bots_tree = ttk.Treeview(tree_frame, columns=columns, show='headings', height=12)
+        for col, title, width in (
+            ('id', 'ID', 50),
+            ('name', 'Имя', 120),
+            ('description', 'Описание', 180),
+            ('token', 'Токен', 280),
+        ):
+            self.bots_tree.heading(col, text=title)
+            self.bots_tree.column(col, width=width, anchor='w')
+        scroll = ttk.Scrollbar(tree_frame, orient='vertical', command=self.bots_tree.yview)
+        self.bots_tree.configure(yscrollcommand=scroll.set)
+        self.bots_tree.pack(side='left', fill='both', expand=True)
+        scroll.pack(side='right', fill='y')
+        self._bot_tokens: dict[str, str] = {}
 
     def _build_game(self):
         self.game_frame = ttk.Frame(self.root, padding=8)
@@ -221,7 +276,16 @@ class WarshipClientApp:
         self._hide_all()
         if not hasattr(self, 'lobby_frame'):
             self._build_lobby()
-        self.user_label.config(text=f'Игрок: {self.api.username} (id={self.api.user_id})')
+        if self.api.is_bot:
+            self.user_label.config(
+                text=f'Бот: {self.api.username} (владелец id={self.api.user_id})',
+            )
+            self.lobby_notebook.tab(self.bots_tab, state='hidden')
+            self.training_check.pack(side='left', padx=8)
+        else:
+            self.user_label.config(text=f'Игрок: {self.api.username} (id={self.api.user_id})')
+            self.lobby_notebook.tab(self.bots_tab, state='normal')
+            self.training_check.pack_forget()
         self.lobby_frame.pack(fill='both', expand=True)
 
     def _show_game(self, game_id: int):
@@ -282,6 +346,27 @@ class WarshipClientApp:
 
         threading.Thread(target=work, daemon=True).start()
 
+    def _do_bot_login(self):
+        self.api.base_url = self.api_url_var.get().strip().rstrip('/')
+        token = self.bot_token_var.get().strip()
+        if not token:
+            self.bot_login_status.config(text='Введите токен бота', foreground='red')
+            return
+        self.bot_login_status.config(text='Вход...', foreground='gray')
+
+        def work():
+            try:
+                self.api.bot_login(token)
+                ws_url = self.ws_url_var.get().strip()
+                self._start_realtime(ws_url)
+                self._ui(self._on_login_ok)
+            except ApiError as exc:
+                self._ui(self.bot_login_status.config, text=str(exc), foreground='red')
+            except Exception as exc:
+                self._ui(self.bot_login_status.config, text=str(exc), foreground='red')
+
+        threading.Thread(target=work, daemon=True).start()
+
     def _do_request_otp(self):
         phone = self.register_phone_var.get().strip()
         if not phone:
@@ -333,9 +418,96 @@ class WarshipClientApp:
 
     def _on_login_ok(self):
         self.login_status.config(text='Успешно', foreground='green')
-        self._build_lobby()
+        if hasattr(self, 'bot_login_status'):
+            self.bot_login_status.config(text='Успешно', foreground='green')
+        if not hasattr(self, 'lobby_frame'):
+            self._build_lobby()
         self._show_lobby()
         self._log(f'Вошли как {self.api.username}')
+        if not self.api.is_bot:
+            self._refresh_bots()
+
+    @staticmethod
+    def _mask_token(token: str) -> str:
+        if len(token) <= 12:
+            return token
+        return f'{token[:8]}...{token[-4:]}'
+
+    def _refresh_bots(self):
+        if self.api.is_bot:
+            return
+
+        def work():
+            try:
+                bots = self.api.list_bots()
+                self._ui(self._apply_bots_list, bots)
+            except ApiError as exc:
+                self._ui(messagebox.showerror, 'Боты', str(exc))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _apply_bots_list(self, bots: list):
+        for item in self.bots_tree.get_children():
+            self.bots_tree.delete(item)
+        self._bot_tokens.clear()
+        for bot in bots:
+            token = bot.get('token', '')
+            item_id = self.bots_tree.insert(
+                '', 'end',
+                values=(bot['id'], bot['name'], bot.get('description') or '', self._mask_token(token)),
+            )
+            self._bot_tokens[item_id] = token
+
+    def _create_bot(self):
+        name = self.new_bot_name_var.get().strip()
+        if not name:
+            messagebox.showwarning('Бот', 'Укажите имя бота')
+            return
+        description = self.new_bot_desc_var.get().strip()
+
+        def work():
+            try:
+                bot = self.api.create_bot(name, description)
+                self._ui(self._log, f'Бот создан: {bot["name"]}, токен: {bot["token"]}')
+                self._ui(self.new_bot_name_var.set, '')
+                self._ui(self.new_bot_desc_var.set, '')
+                self._refresh_bots()
+            except ApiError as exc:
+                self._ui(messagebox.showerror, 'Бот', str(exc))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _delete_bot(self):
+        selected = self.bots_tree.selection()
+        if not selected:
+            messagebox.showwarning('Бот', 'Выберите бота в списке')
+            return
+        bot_id = self.bots_tree.item(selected[0])['values'][0]
+        if not messagebox.askyesno('Бот', f'Удалить бота id={bot_id}?'):
+            return
+
+        def work():
+            try:
+                self.api.delete_bot(int(bot_id))
+                self._ui(self._log, f'Бот id={bot_id} удалён')
+                self._refresh_bots()
+            except ApiError as exc:
+                self._ui(messagebox.showerror, 'Бот', str(exc))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _copy_bot_token(self):
+        selected = self.bots_tree.selection()
+        if not selected:
+            messagebox.showwarning('Бот', 'Выберите бота в списке')
+            return
+        token = self._bot_tokens.get(selected[0])
+        if not token:
+            messagebox.showwarning('Бот', 'Токен не найден')
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(token)
+        self._log(f'Токен скопирован: {self._mask_token(token)}')
 
     def _start_realtime(self, ws_url: str):
         if self.realtime:
@@ -382,7 +554,8 @@ class WarshipClientApp:
     def _matchmaking_find(self):
         def work():
             try:
-                result = self.api.matchmaking_find()
+                is_training = self.training_match_var.get() if self.api.is_bot else None
+                result = self.api.matchmaking_find(is_training=is_training)
                 self._ui(self._log, str(result))
                 action = result.get('action')
                 if action == 'active_game_found':
@@ -547,6 +720,11 @@ class WarshipClientApp:
             self.realtime.stop()
             self.realtime = None
         self.api.access_token = None
+        self.api.refresh_token = None
+        self.api.user_id = None
+        self.api.username = None
+        self.api.is_bot = False
+        self.api.user_bot = None
         self.game_id = None
         self._show_login()
 

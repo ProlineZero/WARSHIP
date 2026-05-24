@@ -196,19 +196,6 @@ def get_game_status_data(game_session):
         game_session=game_session, player=game_session.player2
     ).first()
     
-    moves_raw = list(GameMove.objects.filter(
-        game_session=game_session
-    ).order_by('created_at').values(
-        'id', 'player_id', 'row', 'col', 'hit', 'ship_destroyed', 'ship_size', 'created_at'
-    ))
-    
-    moves = []
-    for move in moves_raw:
-        move_data = dict(move)
-        if move_data.get('created_at'):
-            move_data['created_at'] = move_data['created_at'].isoformat()
-        moves.append(move_data)
-    
     current_turn_data = None
     if game_session.current_turn:
         current_turn_data = {
@@ -237,7 +224,6 @@ def get_game_status_data(game_session):
         'board_size': game_session.board_size,
         'started_at': game_session.started_at.isoformat() if game_session.started_at else None,
         'finished_at': game_session.finished_at.isoformat() if game_session.finished_at else None,
-        'moves': moves,
     }
 
 
