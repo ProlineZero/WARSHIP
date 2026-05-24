@@ -2,6 +2,10 @@
 
 Документ для ИИ-агента / разработчика фронтенда. Описывает **все публичные HTTP-эндпоинты** и **real-time события Centrifugo**, необходимые для полной интеграции с бэкендом.
 
+**Два клиента:**
+- **Игровой UI** — `/api/`, `/api/warship/`
+- **Admin-панель** (отдельный проект) — `/api/admin/`
+
 ---
 
 ## 0. Быстрый старт (что реализовать)
@@ -9,9 +13,13 @@
 ### Архитектура
 
 ```
-Фронтенд
-  ├─ HTTP REST  →  /api/...           (действия: логин, матчмейкинг, ходы)
+Игровой фронтенд
+  ├─ HTTP REST  →  /api/...           (логин, матчмейкинг, ходы)
   └─ WebSocket  →  Centrifugo :8001   (события: игра найдена, выстрел, конец игры)
+
+Admin-панель
+  ├─ HTTP REST  →  /api/admin/...     (группы, пользователи, статистика, управление играми)
+  └─ WebSocket  →  Centrifugo :8001   (наблюдение за game_{id}, staff может подписаться на любую игру)
 ```
 
 **Правило:** пользователь **инициирует действия через HTTP**, а **обновления UI получает через Centrifugo** (и при необходимости дублирует через HTTP polling `GET /status/` и `GET /board/`).
@@ -21,6 +29,7 @@
 | Сервис | URL |
 |--------|-----|
 | REST API | `http://localhost:8000/api` |
+| Admin REST API | `http://localhost:8000/api/admin` |
 | Centrifugo WS | `ws://localhost:8001/connection/websocket` |
 
 ### Авторизация всех игровых запросов
@@ -32,13 +41,23 @@ Content-Type: application/json
 
 JWT живёт **1 день** (`access`), refresh — **28 дней**. Обновление: `POST /api/auth/jwt/refresh/`.
 
-### Минимальный порядок интеграции экранов
+**Забаненный пользователь** (`is_active=false`) не может логиниться и получает `401`/`403` на защищённых эндпоинтах.
+
+### Минимальный порядок интеграции экранов (игровой UI)
 
 1. **Регистрация / логин** → сохранить `access`, `refresh`, `user.id`
 2. **Подключить Centrifugo** → `GET /api/warship/centrifugo/token/` → подписаться на `user_{user_id}`
 3. **Лобби / матчмейкинг** → `POST /api/warship/matchmaking/find/`
 4. **Экран игры** → подписаться на `game_{game_id}`, `POST place_ships`, цикл `GET board` + `POST make_shot`
 5. **Выход** → `POST /api/warship/game/{id}/leave/` + отписаться от канала игры
+
+### Минимальный порядок интеграции (admin-панель)
+
+1. **Логин** пользователя с `is_staff=true` → `POST /api/auth/login/`
+2. **Centrifugo** → `GET /api/admin/centrifugo/token/` → подписка на `game_{id}` активных партий
+3. **Дашборд** → `GET /api/admin/stats/overview/`, `GET /api/admin/stats/games-by-day/`
+4. **Группы / пользователи** → CRUD `/api/admin/groups/`, `/api/admin/users/`
+5. **Наблюдение за игрой** → `GET /api/admin/games/{id}/board/`, `POST control/`, `POST approve-move/`
 
 ---
 
@@ -119,6 +138,8 @@ POST /api/auth/login/
 }
 ```
 
+Ошибка при бане: `400` `{ "non_field_errors": ["Пользователь деактивирован."] }`
+
 ### 1.3. Сброс пароля
 
 **Запрос OTP:**
@@ -177,16 +198,21 @@ POST /api/auth/bot/login/
 }
 ```
 
-**Важно для фронта:**
-- JWT бота содержит claim `is_bot: true` и `user_id` **владельца** (человека).
+**JWT claims бота:**
+- `is_bot: true`
+- `user_id` — ID **владельца** (человека)
+- `user_bot_id` — ID конкретного `UserBot` (для per-bot рейтинга и привязки к игре)
+
+**Ограничения бота:**
 - Бот **не может** вызывать эндпоинты с `@deny_bot` (профиль, CRUD ботов).
-- В матчмейкинге бот автоматически играет training-игры (`is_training: true` в теле запроса).
+- В матчмейкинге бот по умолчанию играет training-игры (`is_training: true` в теле запроса).
+- При первом HTTP-запросе к игре бот автоматически привязывается к `GameSession.playerN_bot`.
 
 ---
 
 ## 2. Профиль пользователя
 
-Все эндпоинты ниже требуют `Authorization: Bearer ...`.
+Все эндпоинты ниже требуют `Authorization: Bearer ...` и активного аккаунта (`is_active=true`).
 
 ### 2.1. Текущий пользователь
 
@@ -228,15 +254,6 @@ PUT /api/user/me/
 ```
 
 Все поля опциональны (partial update). При смене `phone` отправляется OTP — нужен шаг 2.3.
-
-Ответ `200`:
-
-```json
-{
-  "message": "На ваш номер поступит звонок...",
-  "user": { /* UserMeSerializer */ }
-}
-```
 
 > **Бот:** `403` — «Действие недоступно для бота».
 
@@ -288,8 +305,6 @@ POST /api/user/me/bots/
 }
 ```
 
-**Список / один бот** — те же поля (`id`, `name`, `description`, `token`).
-
 > **Бот-JWT:** все CRUD операции запрещены (`403`).
 
 ---
@@ -307,16 +322,28 @@ POST /api/user/me/bots/
 | `finished` | Игра окончена, есть победитель |
 | `cancelled` | Игра отменена (оба офлайн и т.п.) |
 
-### 4.2. Критические бизнес-правила
+### 4.2. Режимы контроля админом (`admin_control_mode`)
+
+| Режим | Поведение |
+|-------|-----------|
+| `normal` | Обычная игра |
+| `delayed` | Минимальная задержка между ходами (`move_delay_ms`) |
+| `manual_step` | Ход ставится в очередь, выполняется после `POST /api/admin/games/{id}/approve-move/` |
+
+Дополнительно: `is_paused=true` блокирует выстрелы (`423`).
+
+### 4.3. Критические бизнес-правила
 
 1. **Одна активная игра на `user_id`** — повторный `matchmaking/find` вернёт `active_game_found`.
 2. **Ход** — только игрок, чей `id` == `current_turn.id`.
 3. **Попадание** — ход **остаётся** у того же игрока. **Промах** — ход переходит сопернику.
 4. **Корабли** — классическая расстановка: `1×4, 2×3, 3×2, 4×1`, поле `10×10`, без касаний (включая диагонали).
 5. **Координаты** — `row`, `col` от **0** до **9**.
-6. **Presence** — подписка на `game_{id}` + HTTP-запросы к игре продлевают «онлайн». Если оба офлайн > 60 сек после старта игры — игра может быть отменена (`game_cancelled`).
+6. **Presence** — подписка на `game_{id}` + HTTP-запросы к игре продлевают «онлайн». Если оба офлайн > 60 сек — возможна отмена (`game_cancelled`).
+7. **Рейтинговые игры** — `is_training=false` учитываются в статистике игрока и бота. Training-игры — нет.
+8. **Per-bot рейтинг** — статистика бота считается по `GameSession.player1_bot` / `player2_bot`, не по владельцу.
 
-### 4.3. Формат корабля
+### 4.4. Формат корабля
 
 ```json
 {
@@ -343,8 +370,6 @@ POST /api/user/me/bots/
   ]
 }
 ```
-
-Ошибка размещения → `400` `{ "error": "текст" }`.
 
 ---
 
@@ -379,61 +404,14 @@ POST /api/warship/matchmaking/find/
 }
 ```
 
-**Ответ B — противник найден сейчас** `200`:
+**Ответ B — противник найден** `200`: `{ "action": "game_found", ... }`
 
-```json
-{
-  "action": "game_found",
-  "status": "success",
-  "message": "Противник найден"
-}
-```
-
-→ Параллельно придёт WS на `user_{id}` (см. §8).
-
-**Ответ C — встал в очередь** `200`:
-
-```json
-{
-  "action": "search_started",
-  "status": "success",
-  "message": "Поиск противника начат"
-}
-```
-
-→ Ждать WS `game_found` на `user_{id}`.
+**Ответ C — в очереди** `200`: `{ "action": "search_started", ... }`
 
 ### 5.2. Отменить поиск
 
 ```http
 POST /api/warship/matchmaking/cancel/
-```
-
-```json
-{}
-```
-
-Ответ:
-
-```json
-{
-  "action": "search_cancelled",
-  "status": "success",
-  "message": "Поиск игры отменен"
-}
-```
-
-### 5.3. Алгоритм UI (матчмейкинг)
-
-```
-1. Убедиться: Centrifugo подключён, подписка user_{my_id} активна
-2. POST matchmaking/find/
-3. switch (response.action):
-     active_game_found → перейти на экран игры game_id
-     game_found        → дождаться WS или повторить find (получит active_game_found)
-     search_started    → показать «поиск...», ждать WS game_found
-4. При нахождении игры → subscribe game_{game_id}
-5. Кнопка «Отмена» → POST matchmaking/cancel/
 ```
 
 ---
@@ -450,33 +428,13 @@ POST /api/warship/challenge/
 { "opponent_id": 2 }
 ```
 
-Ответ `200`:
-
-```json
-{
-  "game_id": 55,
-  "status": "success",
-  "game_status": "waiting_challenge",
-  "player1": { "id": 1, "username": "player1" },
-  "player2": { "id": 2, "username": "player2" }
-}
-```
-
-Соперник получает WS `challenge_created` на `user_{opponent_id}`.
+Challenge-игры создаются с `is_training=true`.
 
 ### 6.2. Принять вызов
 
 ```http
 POST /api/warship/game/{game_id}/accept_challenge/
 ```
-
-Ответ `200`:
-
-```json
-{ "message": "Вызов принят" }
-```
-
-Статус игры → `waiting_ships`. Оба игрока получают WS `game_found`.
 
 ---
 
@@ -497,11 +455,18 @@ GET /api/warship/game/{game_id}/status/
   "data": {
     "game_id": 42,
     "status": "player1_turn",
+    "is_training": false,
     "player1": { "id": 1, "username": "p1", "ships_placed": true },
     "player2": { "id": 2, "username": "p2", "ships_placed": true },
+    "player1_bot": { "id": 5, "name": "Alpha" },
+    "player2_bot": null,
     "current_turn": { "id": 1, "username": "p1" },
     "winner": null,
     "board_size": 10,
+    "admin_control_mode": "normal",
+    "move_delay_ms": 0,
+    "is_paused": false,
+    "pending_move": null,
     "started_at": "2026-05-21T12:00:00+00:00",
     "finished_at": null
   }
@@ -520,22 +485,14 @@ GET /api/warship/game/{game_id}/board/
   "status": "success",
   "data": {
     "board_size": 10,
-    "my_ships": [
-      { "size": 4, "cells": [[0,0],[0,1],[0,2],[0,3]], "destroyed": false }
-    ],
-    "my_shots": [
-      { "row": 5, "col": 3, "hit": true, "ship_destroyed": false, "ship_size": 3 }
-    ],
-    "opponent_shots": [
-      { "row": 1, "col": 1, "hit": false, "ship_destroyed": false, "ship_size": null }
-    ]
+    "my_ships": [ /* корабли */ ],
+    "my_shots": [ { "row": 5, "col": 3, "hit": true, "ship_destroyed": false, "ship_size": 3 } ],
+    "opponent_shots": [ /* выстрелы соперника по вам */ ]
   }
 }
 ```
 
-**UI:**
-- Своя сетка — `my_ships` + `opponent_shots` (куда стрелял соперник).
-- Сетка противника — только `my_shots` (свои выстрелы; корабли противника **не отдаются**).
+**UI:** корабли противника **не отдаются** — только свои выстрелы по нему.
 
 ### 7.3. Разместить корабли
 
@@ -544,17 +501,7 @@ POST /api/warship/game/{game_id}/place_ships/
 ```
 
 ```json
-{ "ships": [ /* см. §4.3 */ ] }
-```
-
-Успех `200`:
-
-```json
-{
-  "action": "place_ships",
-  "status": "success",
-  "message": "Корабли успешно размещены"
-}
+{ "ships": [ /* см. §4.4 */ ] }
 ```
 
 Когда **оба** расставили — WS `game_started` + `game_status`.
@@ -569,7 +516,7 @@ POST /api/warship/game/{game_id}/make_shot/
 { "row": 5, "col": 3 }
 ```
 
-Успех `200`:
+**Успех** `200`:
 
 ```json
 {
@@ -581,34 +528,36 @@ POST /api/warship/game/{game_id}/make_shot/
     "ship_destroyed": false,
     "ship_size": 3,
     "game_finished": false,
-    "winner": null
+    "winner": null,
+    "row": 5,
+    "col": 3
   }
 }
 ```
 
-При победе:
+**Ожидание подтверждения админа** (`manual_step`) — `202`:
 
 ```json
 {
+  "action": "make_shot",
+  "status": "pending",
   "data": {
-    "success": true,
-    "hit": true,
-    "ship_destroyed": true,
-    "ship_size": 1,
-    "game_finished": true,
-    "winner": { "id": 1, "username": "p1" }
+    "success": false,
+    "error": "Ход ожидает подтверждения администратора",
+    "awaiting_approval": true,
+    "pending_move": { "player_id": 1, "row": 5, "col": 3, "bot_id": 5 }
   }
 }
 ```
 
-Ошибки `400`:
+**Ошибки:**
 
-| error | Когда |
-|-------|-------|
-| `Сейчас не ваш ход` | Не ваш `current_turn` |
-| `Игра еще не начата` | status = `waiting_ships` |
-| `Игра уже завершена` | status = `finished` |
-| `Вы не участник этой игры` | `403` |
+| HTTP | error / поле | Когда |
+|------|--------------|-------|
+| `400` | текст | Невалидный ход, не ваш ход, игра не начата |
+| `403` | `Вы не участник этой игры` | — |
+| `423` | `Игра на паузе` | `is_paused=true` |
+| `429` | `Слишком рано для следующего хода` + `retry_after_ms` | режим `delayed` |
 
 ### 7.5. Выйти из игры
 
@@ -616,29 +565,11 @@ POST /api/warship/game/{game_id}/make_shot/
 POST /api/warship/game/{game_id}/leave/
 ```
 
-```json
-{}
-```
-
-Ответ:
-
-```json
-{
-  "action": "game_left",
-  "status": "success",
-  "message": "Вы вышли из игры"
-}
-```
-
-После выхода обоих (и офлайн) возможна отмена → WS `game_cancelled`.
-
 ---
 
 ## 8. Centrifugo (WebSocket)
 
-### 8.1. Подключение
-
-**Шаг 1 — токен:**
+### 8.1. Подключение (игрок)
 
 ```http
 GET /api/warship/centrifugo/token/
@@ -649,29 +580,21 @@ Authorization: Bearer <access>
 { "token": "<centrifugo_connection_token>" }
 ```
 
-**Шаг 2 — WS-клиент** (библиотека `centrifuge-js` / `centrifuge-python`):
-
-- URL: `ws://localhost:8001/connection/websocket`
-- Передать `token` при connect
-
-**Шаг 3 — подписки:**
+**Подписки:**
 
 | Канал | Когда | События |
 |-------|-------|---------|
-| `user_{user_id}` | Сразу после логина | матчмейкинг, вызовы |
+| `user_{user_id}` | После логина | матчмейкинг, вызовы |
 | `game_{game_id}` | Когда известен `game_id` | ходы, статус, конец игры |
-
-`user_id` берётся из JWT claim `user_id` или `GET /api/user/me/`.
 
 ### 8.2. Безопасность каналов
 
-Подписка на `game_{id}` проходит через **subscribe proxy** бэкенда — только участники игры. Не-участник получит отказ.
+- **Игрок** — subscribe proxy разрешает `game_{id}` только участникам.
+- **Admin (`is_staff=true`)** — может подписаться на **любой** `game_{id}` (read-only наблюдение).
 
-Presence продлевается через:
-- подписку / refresh канала игры;
-- любой HTTP к `/api/warship/game/{id}/...` (кроме `leave`).
+Presence продлевается через подписку / refresh канала и HTTP к `/api/warship/game/{id}/...`.
 
-### 8.3. События на канале `user_{user_id}`
+### 8.3. События на `user_{user_id}`
 
 #### `game_found`
 
@@ -688,8 +611,6 @@ Presence продлевается через:
 }
 ```
 
-**Действие UI:** сохранить `game_id`, подписаться на `game_{game_id}`, открыть экран игры.
-
 #### `challenge_created`
 
 ```json
@@ -697,21 +618,15 @@ Presence продлевается через:
   "action": "challenge_created",
   "game_id": 55,
   "game_status": "waiting_challenge",
-  "opponent": {
-    "id": 1,
-    "username": "player1",
-    "stats": {}
-  }
+  "opponent": { "id": 1, "username": "player1", "stats": {} }
 }
 ```
 
-**Действие UI:** показать диалог «Принять вызов?» → `POST accept_challenge`.
-
-### 8.4. События на канале `game_{game_id}`
+### 8.4. События на `game_{game_id}`
 
 #### `game_status`
 
-Полный объект статуса (как `GET /status/` → `data`).
+Полный объект статуса (как `GET /status/` → `data`, включая `admin_control_mode`, `is_paused`, `pending_move`).
 
 #### `game_started`
 
@@ -744,7 +659,20 @@ Presence продлевается через:
 }
 ```
 
-После выстрела **всегда** следом приходит `game_status` с обновлённым `current_turn`.
+#### `admin_move_pending` (режим `manual_step`)
+
+```json
+{
+  "action": "admin_move_pending",
+  "status": "success",
+  "data": {
+    "game_id": 42,
+    "pending_move": { "player_id": 1, "row": 5, "col": 3, "bot_id": 5 }
+  }
+}
+```
+
+**Admin UI:** показать кнопку «Подтвердить ход» → `POST /api/admin/games/{id}/approve-move/`.
 
 #### `game_finished`
 
@@ -766,16 +694,283 @@ Presence продлевается через:
 {
   "action": "game_cancelled",
   "status": "success",
-  "data": {
-    "game_id": 42,
-    "finished_at": "2026-05-21T12:15:00+00:00"
-  }
+  "data": { "game_id": 42, "finished_at": "..." }
 }
 ```
 
 ---
 
-## 9. Диаграмма жизненного цикла игры
+## 9. Admin API (`/api/admin/`)
+
+**Требования:** JWT пользователя с `is_staff=true`. Все эндпоинты: `401` без токена, `403` без staff или при бане.
+
+### 9.1. Группы (`PlayerGroup`)
+
+Один ученик — одна группа. Без `group_id` в рейтингах — весь университет (инстанс).
+
+| Метод | URL | Описание |
+|-------|-----|----------|
+| `GET` | `/api/admin/groups/` | Список групп |
+| `POST` | `/api/admin/groups/` | Создать `{ "name", "description?" }` |
+| `GET` | `/api/admin/groups/{id}/` | Одна группа |
+| `PUT` | `/api/admin/groups/{id}/` | Обновить |
+| `DELETE` | `/api/admin/groups/{id}/` | Удалить (участники отвязываются) |
+| `GET` | `/api/admin/groups/{id}/members/` | Участники + stats |
+| `POST` | `/api/admin/groups/{id}/members/` | Добавить участника |
+| `DELETE` | `/api/admin/groups/{id}/members/{user_id}/` | Убрать из группы |
+
+**Добавление участника** — один из вариантов:
+
+```json
+{ "user_id": 10 }
+```
+
+```json
+{ "username": "student1", "password": "secret123" }
+```
+
+Во втором случае пользователь **создаётся** и сразу добавляется в группу.
+
+**Ответ группы:**
+
+```json
+{
+  "id": 1,
+  "name": "ИТ-21-1",
+  "description": "",
+  "created_at": "2026-05-21T10:00:00Z",
+  "members_count": 25
+}
+```
+
+### 9.2. Пользователи
+
+| Метод | URL | Описание |
+|-------|-----|----------|
+| `GET` | `/api/admin/users/` | Список. Query: `group_id`, `is_active`, `search` |
+| `POST` | `/api/admin/users/` | Создать `{ "username", "password", "group_id?", "is_staff?" }` |
+| `GET` | `/api/admin/users/{id}/` | Профиль |
+| `PUT` | `/api/admin/users/{id}/` | Обновить (в т.ч. `group_id`, `password`, `is_staff`) |
+| `POST` | `/api/admin/users/{id}/ban/` | `{ "reason" }` |
+| `POST` | `/api/admin/users/{id}/unban/` | Снять бан |
+
+**Ответ пользователя:**
+
+```json
+{
+  "id": 10,
+  "username": "student1",
+  "first_name": "",
+  "last_name": "",
+  "email": "",
+  "phone": null,
+  "is_active": true,
+  "is_staff": false,
+  "is_banned": false,
+  "ban_reason": "",
+  "banned_at": null,
+  "group": { "id": 1, "name": "ИТ-21-1", "description": "", "created_at": "...", "members_count": 25 },
+  "group_id": 1,
+  "stats": { "total_games": 12, "wins": 7, "win_rate": 58.33 },
+  "date_joined": "...",
+  "last_login": "..."
+}
+```
+
+### 9.3. Статистика (дашборд)
+
+**Обзор:**
+
+```http
+GET /api/admin/stats/overview/
+```
+
+```json
+{
+  "active_games": 5,
+  "active_player_vs_player": 2,
+  "active_with_bots": 3,
+  "active_training": 4,
+  "active_ranked": 1,
+  "finished_today": 120,
+  "total_users": 150,
+  "total_bots": 80,
+  "banned_users": 2
+}
+```
+
+**График игр по дням** (данные для chart.js / recharts):
+
+```http
+GET /api/admin/stats/games-by-day/?days=30
+```
+
+```json
+[
+  { "date": "2026-05-24", "total": 100, "ranked": 80, "training": 20 },
+  { "date": "2026-05-25", "total": 120, "ranked": 95, "training": 25 }
+]
+```
+
+### 9.4. Рейтинги
+
+```http
+GET /api/admin/leaderboard/students/?group_id=1
+GET /api/admin/leaderboard/bots/?group_id=1
+```
+
+Без `group_id` — рейтинг по всему университету.
+
+**Ответ (students):**
+
+```json
+[
+  {
+    "rank": 1,
+    "user_id": 10,
+    "username": "student1",
+    "group_id": 1,
+    "group_name": "ИТ-21-1",
+    "stats": { "total_games": 20, "wins": 15, "win_rate": 75.0 }
+  }
+]
+```
+
+**Ответ (bots):**
+
+```json
+[
+  {
+    "rank": 1,
+    "bot_id": 5,
+    "bot_name": "Alpha",
+    "owner_id": 10,
+    "owner_username": "student1",
+    "group_id": 1,
+    "group_name": "ИТ-21-1",
+    "stats": { "total_games": 15, "wins": 12, "win_rate": 80.0 }
+  }
+]
+```
+
+Сортировка: `wins DESC` → `win_rate DESC` → `total_games DESC`.
+
+### 9.5. Боты
+
+```http
+GET /api/admin/bots/?group_id=1&active_only=true
+```
+
+```json
+[
+  {
+    "id": 5,
+    "name": "Alpha",
+    "description": "...",
+    "owner": {
+      "id": 10,
+      "username": "student1",
+      "group_id": 1,
+      "group_name": "ИТ-21-1"
+    },
+    "stats": { "total_games": 15, "wins": 12, "win_rate": 80.0 },
+    "is_in_active_game": true,
+    "last_game_at": "2026-05-25T12:00:00+00:00",
+    "created_at": "..."
+  }
+]
+```
+
+**Админ vs бот:**
+
+```http
+POST /api/admin/bots/{bot_id}/challenge/
+```
+
+Создаёт training-игру: admin = player1, владелец бота = player2, `player2_bot` = бот. Статус сразу `waiting_ships`.
+
+**Bot vs bot:**
+
+```http
+POST /api/admin/bots/versus/
+```
+
+```json
+{
+  "bot1_id": 5,
+  "bot2_id": 7,
+  "is_training": true
+}
+```
+
+Оба владельца получают WS `game_found`. Ходы выполняют внешние bot-клиенты.
+
+### 9.6. Наблюдение и управление играми
+
+| Метод | URL | Описание |
+|-------|-----|----------|
+| `GET` | `/api/admin/games/active/?group_id=&has_bot=` | Активные игры |
+| `GET` | `/api/admin/games/{id}/` | Детали игры |
+| `GET` | `/api/admin/games/{id}/board/` | **Обе** доски (корабли + выстрелы обоих игроков) |
+| `POST` | `/api/admin/games/{id}/control/` | Управление темпом |
+| `POST` | `/api/admin/games/{id}/approve-move/` | Подтвердить ход в `manual_step` |
+| `GET` | `/api/admin/centrifugo/token/` | WS-токен для admin |
+
+**Admin board** (в отличие от игрового — видны корабли обоих):
+
+```json
+{
+  "action": "admin_board_state",
+  "status": "success",
+  "data": {
+    "game_id": 42,
+    "board_size": 10,
+    "player1": {
+      "player_id": 1,
+      "username": "p1",
+      "ships": [ /* все корабли */ ],
+      "shots": [ /* выстрелы p1 */ ]
+    },
+    "player2": { /* аналогично */ }
+  }
+}
+```
+
+**Управление игрой:**
+
+```http
+POST /api/admin/games/{id}/control/
+```
+
+```json
+{
+  "admin_control_mode": "manual_step",
+  "move_delay_ms": 2000,
+  "is_paused": false
+}
+```
+
+Допустимые `admin_control_mode`: `normal`, `delayed`, `manual_step`.
+
+**Подтверждение хода:**
+
+```http
+POST /api/admin/games/{id}/approve-move/
+```
+
+Выполняет `pending_move`, публикует WS `shot_result` + `game_status` (и `game_finished` при победе).
+
+### 9.7. Centrifugo для admin
+
+```http
+GET /api/admin/centrifugo/token/
+```
+
+Тот же формат `{ "token": "..." }`. Admin с `is_staff=true` может подписаться на любой `game_{id}`.
+
+---
+
+## 10. Диаграмма жизненного цикла игры
 
 ```mermaid
 stateDiagram-v2
@@ -786,6 +981,8 @@ stateDiagram-v2
     WaitingShips --> InGame: оба place_ships → game_started
     InGame --> InGame: make_shot (hit → тот же ход)
     InGame --> InGame: make_shot (miss → смена хода)
+    InGame --> PendingApproval: manual_step → 202
+    PendingApproval --> InGame: admin approve-move
     InGame --> Finished: game_finished
     InGame --> Cancelled: game_cancelled
     Finished --> [*]
@@ -794,7 +991,9 @@ stateDiagram-v2
 
 ---
 
-## 10. Полный список эндпоинтов
+## 11. Полный список эндпоинтов
+
+### Auth / User / Bots
 
 | Метод | Путь | Auth | Описание |
 |-------|------|------|----------|
@@ -808,27 +1007,55 @@ stateDiagram-v2
 | GET | `/api/user/me/` | ✓ | Профиль |
 | PUT | `/api/user/me/` | ✓ | Обновить профиль |
 | POST | `/api/user/me/confirm-phone/` | ✓ | Подтвердить телефон |
-| GET | `/api/user/me/bots/` | ✓ | Список ботов |
-| GET | `/api/user/me/bots/{id}/` | ✓ | Один бот |
-| POST | `/api/user/me/bots/` | ✓ | Создать бота |
-| PUT | `/api/user/me/bots/{id}/` | ✓ | Обновить бота |
-| DELETE | `/api/user/me/bots/{id}/` | ✓ | Удалить бота |
+| GET/POST | `/api/user/me/bots/` | ✓ | Список / создать бота |
+| GET/PUT/DELETE | `/api/user/me/bots/{id}/` | ✓ | CRUD бота |
+
+### Игра
+
+| Метод | Путь | Auth | Описание |
+|-------|------|------|----------|
 | POST | `/api/warship/matchmaking/find/` | ✓ | Найти игру |
 | POST | `/api/warship/matchmaking/cancel/` | ✓ | Отменить поиск |
 | POST | `/api/warship/challenge/` | ✓ | Вызов игроку |
 | POST | `/api/warship/game/{id}/accept_challenge/` | ✓ | Принять вызов |
 | GET | `/api/warship/game/{id}/status/` | ✓ | Статус |
-| GET | `/api/warship/game/{id}/board/` | ✓ | Доска |
+| GET | `/api/warship/game/{id}/board/` | ✓ | Доска (участник) |
 | POST | `/api/warship/game/{id}/place_ships/` | ✓ | Расстановка |
 | POST | `/api/warship/game/{id}/make_shot/` | ✓ | Выстрел |
 | POST | `/api/warship/game/{id}/leave/` | ✓ | Выход |
 | GET | `/api/warship/centrifugo/token/` | ✓ | WS-токен |
 
-> Эндпоинты `/api/warship/centrifugo/proxy/*` — **только для Centrifugo**, фронт не вызывает.
+### Admin
+
+| Метод | Путь | Staff | Описание |
+|-------|------|-------|----------|
+| GET/POST | `/api/admin/groups/` | ✓ | Группы |
+| GET/PUT/DELETE | `/api/admin/groups/{id}/` | ✓ | CRUD группы |
+| GET/POST | `/api/admin/groups/{id}/members/` | ✓ | Участники |
+| DELETE | `/api/admin/groups/{id}/members/{user_id}/` | ✓ | Удалить из группы |
+| GET/POST | `/api/admin/users/` | ✓ | Пользователи |
+| GET/PUT | `/api/admin/users/{id}/` | ✓ | CRUD пользователя |
+| POST | `/api/admin/users/{id}/ban/` | ✓ | Бан |
+| POST | `/api/admin/users/{id}/unban/` | ✓ | Разбан |
+| GET | `/api/admin/stats/overview/` | ✓ | Обзор статистики |
+| GET | `/api/admin/stats/games-by-day/` | ✓ | График по дням |
+| GET | `/api/admin/leaderboard/students/` | ✓ | Рейтинг учеников |
+| GET | `/api/admin/leaderboard/bots/` | ✓ | Рейтинг ботов |
+| GET | `/api/admin/bots/` | ✓ | Список ботов |
+| POST | `/api/admin/bots/versus/` | ✓ | Bot vs bot |
+| POST | `/api/admin/bots/{id}/challenge/` | ✓ | Admin vs bot |
+| GET | `/api/admin/games/active/` | ✓ | Активные игры |
+| GET | `/api/admin/games/{id}/` | ✓ | Детали игры |
+| GET | `/api/admin/games/{id}/board/` | ✓ | Доска (обе стороны) |
+| POST | `/api/admin/games/{id}/control/` | ✓ | Пауза / режим / задержка |
+| POST | `/api/admin/games/{id}/approve-move/` | ✓ | Подтвердить ход |
+| GET | `/api/admin/centrifugo/token/` | ✓ | WS-токен admin |
+
+> `/api/warship/centrifugo/proxy/*` — **только для Centrifugo**, фронт не вызывает.
 
 ---
 
-## 11. Формат ошибок
+## 12. Формат ошибок
 
 **Валидация (serializer):** `400`
 
@@ -839,38 +1066,48 @@ stateDiagram-v2
 }
 ```
 
-**Бизнес-ошибка (views):** `400` / `403` / `404`
+**Бизнес-ошибка (views):** `400` / `403` / `404` / `423` / `429`
 
 ```json
 { "error": "Сейчас не ваш ход" }
 ```
 
-**401** — нет / протух JWT.
+**401** — нет / протух JWT, или пользователь деактивирован.
+
+**403** — нет прав (не staff для admin, не участник игры, бот на `@deny_bot`).
 
 ---
 
-## 12. Чеклист для ИИ-агента (фронт)
+## 13. Чеклист для ИИ-агента
+
+### Игровой фронт
 
 - [ ] HTTP-клиент с автоподстановкой `Authorization` и refresh при 401
-- [ ] Хранить `user.id`, `access`, `refresh`
 - [ ] Centrifugo: connect → subscribe `user_{id}` → on `game_found` subscribe `game_{id}`
 - [ ] Не начинать второй матчмейкинг при активной игре
 - [ ] Экран расстановки: блокировать до `waiting_ships`, отправить `place_ships` один раз
-- [ ] Экран боя: клик по клетке только если `current_turn.id === myUserId`
-- [ ] После `make_shot` обновлять UI из WS (`shot_result` + `game_status`) или `GET board`
-- [ ] Экран победы/поражения по `game_finished`
-- [ ] При unmount / logout: `leave` + unsubscribe `game_{id}`
-- [ ] CORS уже открыт (`*`) — достаточно стандартных заголовков
+- [ ] Экран боя: клик только если `current_turn.id === myUserId`
+- [ ] Обрабатывать `423` (пауза) и `429` (задержка) при admin-контроле
+- [ ] После `make_shot` обновлять UI из WS или `GET board`
+- [ ] При unmount: `leave` + unsubscribe `game_{id}`
+
+### Admin-панель
+
+- [ ] Логин staff-пользователя через `/api/auth/login/`
+- [ ] Centrifugo + подписка на `game_{id}` активных партий
+- [ ] График из `games-by-day` (массив `{ date, total, ranked, training }`)
+- [ ] CRUD групп и пользователей, ban/unban
+- [ ] Рейтинги с фильтром `group_id` (группа / весь университет)
+- [ ] Bot vs bot, admin vs bot
+- [ ] Наблюдение: `GET board` (обе стороны), `control`, `approve-move` при `admin_move_pending`
 
 ---
 
-## 13. Референс-реализация
-
-Рабочий клиент на Python (можно смотреть логику интеграции):
+## 14. Референс-реализация
 
 - `game_client/api_client.py` — синхронный REST
 - `game_client/realtime.py` — Centrifugo
 - `game_client/app.py` — GUI с полным циклом игры
-- `game_client/load_test/player.py` — async-версия для нагрузочного теста
+- `core/tests/test_admin_api.py` — тесты admin API
 
-Существующий протокол (частично устарел): `warship/PROTOCOL.md` — при расхождении **источник истины — этот файл и код в `warship/views.py`**.
+При расхождении **источник истины — этот файл и код** в `core/views/admin/`, `warship/views.py`.

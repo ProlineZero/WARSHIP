@@ -7,6 +7,8 @@ from django.utils.decorators import method_decorator
 from django.views import View
 from django.views.decorators.csrf import csrf_exempt
 
+from django.contrib.auth import get_user_model
+
 from warship.game_presence import (
     get_active_game_session,
     is_game_participant,
@@ -14,6 +16,8 @@ from warship.game_presence import (
     subscription_expire_at,
     touch_presence,
 )
+
+User = get_user_model()
 
 logger = logging.getLogger('ws_app')
 
@@ -54,7 +58,14 @@ class CentrifugoSubscribeProxyView(View):
             return JsonResponse({'result': {}})
 
         game_session = get_active_game_session(game_id)
-        if not game_session or not user_id or not is_game_participant(game_session, user_id):
+        if not game_session or not user_id:
+            return _proxy_forbidden()
+
+        is_admin_observer = User.objects.filter(id=user_id, is_staff=True, is_active=True).exists()
+        if is_admin_observer:
+            return JsonResponse({'result': {'expire_at': subscription_expire_at()}})
+
+        if not is_game_participant(game_session, user_id):
             return _proxy_forbidden()
         if game_session.status in (
             game_session.GameStatus.FINISHED,
@@ -89,7 +100,14 @@ class CentrifugoSubRefreshProxyView(View):
             return JsonResponse({'result': {}})
 
         game_session = get_active_game_session(game_id)
-        if not game_session or not user_id or not is_game_participant(game_session, user_id):
+        if not game_session or not user_id:
+            return JsonResponse({'result': {'expired': True}})
+
+        is_admin_observer = User.objects.filter(id=user_id, is_staff=True, is_active=True).exists()
+        if is_admin_observer:
+            return JsonResponse({'result': {'expire_at': subscription_expire_at()}})
+
+        if not is_game_participant(game_session, user_id):
             return JsonResponse({'result': {'expired': True}})
 
         touch_presence(game_id, user_id)

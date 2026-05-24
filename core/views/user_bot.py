@@ -5,6 +5,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from core.auth import BotAccessMixin, deny_bot
+from core.auth.admin_access import IsActiveUser
 from core.models.user_bot import UserBot
 from core.serializers.user_bot import UserBotCreateSerializer, UserBotLoginSerializer, UserBotSerializer
 
@@ -20,7 +21,7 @@ class UserBotLoginAPIView(APIView):
         return Response(payload, status=status.HTTP_200_OK)
 
 class UserBotAPIView(BotAccessMixin, APIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, IsActiveUser]
 
 
     def get(self, request, *args, **kwargs):

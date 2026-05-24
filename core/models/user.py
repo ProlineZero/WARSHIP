@@ -41,6 +41,25 @@ class User(AbstractUser):
 
     metadata = models.JSONField(default=dict, blank=True)
 
+    group = models.ForeignKey(
+        'core.PlayerGroup',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='members',
+        verbose_name='Группа',
+    )
+    ban_reason = models.TextField(blank=True, default='', verbose_name='Причина бана')
+    banned_at = models.DateTimeField(null=True, blank=True, verbose_name='Забанен')
+    banned_by = models.ForeignKey(
+        'self',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='banned_users',
+        verbose_name='Забанил',
+    )
+
     @staticmethod
     def _parse_phone_number(phone_str: str) -> (str):
         """

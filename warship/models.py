@@ -95,6 +95,39 @@ class GameSession(models.Model):
         blank=True,
         verbose_name='Время окончания'
     )
+
+    player1_bot = models.ForeignKey(
+        'core.UserBot',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='games_as_player1_bot',
+        verbose_name='Бот первого игрока',
+    )
+    player2_bot = models.ForeignKey(
+        'core.UserBot',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='games_as_player2_bot',
+        verbose_name='Бот второго игрока',
+    )
+
+    class AdminControlMode(models.TextChoices):
+        NORMAL = 'normal', 'Обычный'
+        DELAYED = 'delayed', 'С задержкой'
+        MANUAL_STEP = 'manual_step', 'Ручной шаг'
+
+    admin_control_mode = models.CharField(
+        max_length=20,
+        choices=AdminControlMode.choices,
+        default=AdminControlMode.NORMAL,
+        verbose_name='Режим контроля админом',
+    )
+    move_delay_ms = models.PositiveIntegerField(default=0, verbose_name='Задержка хода (мс)')
+    is_paused = models.BooleanField(default=False, verbose_name='Пауза')
+    pending_move = models.JSONField(null=True, blank=True, verbose_name='Ожидающий ход')
+    last_move_at = models.DateTimeField(null=True, blank=True, verbose_name='Время последнего хода')
     
     class Meta:
         verbose_name = 'Сессия игры'
@@ -124,24 +157,39 @@ class GameSession(models.Model):
     
     def finish_game(self, winner):
         """Завершает игру и устанавливает победителя."""
-        
-        from warship.utils import get_player_stats
 
+        from warship.utils import get_bot_stats, get_player_stats
 
         if self.status == self.GameStatus.FINISHED:
             raise ValidationError('Игра уже завершена')
-        
+
         if winner not in [self.player1, self.player2]:
             raise ValidationError('Победитель должен быть одним из игроков')
-        
+
         self.status = self.GameStatus.FINISHED
         self.winner = winner
         self.current_turn = None
+        self.pending_move = None
         self.finished_at = timezone.now()
-        self.player1.metadata['stats'] = get_player_stats(self.player1)
-        self.player1.save()
-        self.player2.metadata['stats'] = get_player_stats(self.player2)
-        self.player2.save()
+
+        if not self.is_training:
+            self.player1.metadata['stats'] = get_player_stats(self.player1)
+            self.player1.save(update_fields=['metadata'])
+            if self.player2_id:
+                self.player2.metadata['stats'] = get_player_stats(self.player2)
+                self.player2.save(update_fields=['metadata'])
+
+            from core.models.user_bot import UserBot
+
+            if self.player1_bot_id:
+                bot = UserBot.objects.get(pk=self.player1_bot_id)
+                bot.metadata['stats'] = get_bot_stats(bot)
+                bot.save(update_fields=['metadata'])
+            if self.player2_bot_id:
+                bot = UserBot.objects.get(pk=self.player2_bot_id)
+                bot.metadata['stats'] = get_bot_stats(bot)
+                bot.save(update_fields=['metadata'])
+
         self.save()
     
     def cancel_game(self):
@@ -548,27 +596,10 @@ def validate_shot(game_session: GameSession, player, row: int, col: int) -> dict
     }
 
 
-def make_shot(game_session: GameSession, player, row: int, col: int) -> dict:
+def make_shot(game_session: GameSession, player, row: int, col: int, *, skip_control_gates: bool = False) -> dict:
     """
     Выполняет выстрел игрока.
-    
-    Args:
-        game_session: Сессия игры
-        player: Игрок, делающий выстрел
-        row: Строка выстрела
-        col: Столбец выстрела
-    
-    Returns:
-        dict с результатами выстрела:
-        - success: bool - успешен ли выстрел
-        - hit: bool - попал ли
-        - ship_destroyed: bool - уничтожен ли корабль
-        - ship_size: int - размер корабля
-        - game_finished: bool - завершена ли игра
-        - winner: User - победитель (если игра завершена)
-        - error: str - сообщение об ошибке
     """
-    # Валидация выстрела
     validation = validate_shot(game_session, player, row, col)
     if not validation['valid']:
         return {
@@ -578,10 +609,10 @@ def make_shot(game_session: GameSession, player, row: int, col: int) -> dict:
             'ship_destroyed': False,
             'ship_size': None,
             'game_finished': False,
-            'winner': None
+            'winner': None,
+            'awaiting_approval': False,
         }
-    
-    # Проверяем, что это ход игрока
+
     if game_session.current_turn != player:
         return {
             'success': False,
@@ -590,16 +621,58 @@ def make_shot(game_session: GameSession, player, row: int, col: int) -> dict:
             'ship_destroyed': False,
             'ship_size': None,
             'game_finished': False,
-            'winner': None
+            'winner': None,
+            'awaiting_approval': False,
         }
-    
-    # Проверяем попадание
+
+    if not skip_control_gates:
+        if game_session.is_paused:
+            return {
+                'success': False,
+                'error': 'Игра на паузе',
+                'hit': False,
+                'ship_destroyed': False,
+                'ship_size': None,
+                'game_finished': False,
+                'winner': None,
+                'awaiting_approval': False,
+                'paused': True,
+            }
+
+        if game_session.admin_control_mode == GameSession.AdminControlMode.MANUAL_STEP:
+            return {
+                'success': False,
+                'error': 'Ход ожидает подтверждения администратора',
+                'hit': False,
+                'ship_destroyed': False,
+                'ship_size': None,
+                'game_finished': False,
+                'winner': None,
+                'awaiting_approval': True,
+            }
+
+        if game_session.admin_control_mode == GameSession.AdminControlMode.DELAYED and game_session.move_delay_ms:
+            if game_session.last_move_at:
+                elapsed_ms = (timezone.now() - game_session.last_move_at).total_seconds() * 1000
+                if elapsed_ms < game_session.move_delay_ms:
+                    return {
+                        'success': False,
+                        'error': 'Слишком рано для следующего хода',
+                        'hit': False,
+                        'ship_destroyed': False,
+                        'ship_size': None,
+                        'game_finished': False,
+                        'winner': None,
+                        'awaiting_approval': False,
+                        'retry_after_ms': int(game_session.move_delay_ms - elapsed_ms),
+                    }
+
     opponent = game_session.get_opponent(player)
     opponent_placement = ShipPlacement.objects.filter(
         game_session=game_session,
         player=opponent
     ).first()
-    
+
     if not opponent_placement:
         return {
             'success': False,
@@ -608,23 +681,36 @@ def make_shot(game_session: GameSession, player, row: int, col: int) -> dict:
             'ship_destroyed': False,
             'ship_size': None,
             'game_finished': False,
-            'winner': None
+            'winner': None,
+            'awaiting_approval': False,
         }
-    
+
     hit_result = opponent_placement.check_hit(row, col)
-    
-    # Проверяем, завершена ли игра
+
+    GameMove.objects.create(
+        game_session=game_session,
+        player=player,
+        row=row,
+        col=col,
+        hit=hit_result['hit'],
+        ship_destroyed=hit_result['ship_destroyed'],
+        ship_size=hit_result.get('ship_size'),
+    )
+
     game_finished = False
     winner = None
-    
+
     if opponent_placement.all_ships_destroyed():
         game_session.finish_game(player)
         game_finished = True
         winner = player
     elif not hit_result['hit']:
-        # Если промах, переключаем ход
         game_session.switch_turn()
-    
+
+    game_session.last_move_at = timezone.now()
+    game_session.pending_move = None
+    game_session.save(update_fields=['last_move_at', 'pending_move'])
+
     return {
         'success': True,
         'error': None,
@@ -633,4 +719,7 @@ def make_shot(game_session: GameSession, player, row: int, col: int) -> dict:
         'ship_size': hit_result.get('ship_size'),
         'game_finished': game_finished,
         'winner': winner,
+        'awaiting_approval': False,
+        'row': row,
+        'col': col,
     }

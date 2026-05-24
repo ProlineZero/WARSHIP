@@ -4,7 +4,7 @@ from typing import Callable
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.request import Request
 
-from core.tokens.user_bot import IS_BOT_CLAIM
+from core.tokens.user_bot import IS_BOT_CLAIM, USER_BOT_ID_CLAIM
 
 _DENY_BOT_ATTR = "_deny_bot"
 _ALLOW_BOT_ONLY_ATTR = "_allow_bot_only"
@@ -18,6 +18,18 @@ def is_bot_request(request: Request) -> bool:
     if callable(getter):
         return bool(getter(IS_BOT_CLAIM))
     return bool(getattr(token, IS_BOT_CLAIM, False))
+
+
+def get_request_user_bot_id(request: Request) -> int | None:
+    token = getattr(request, "auth", None)
+    if token is None:
+        return None
+    getter = getattr(token, "get", None)
+    if callable(getter):
+        bot_id = getter(USER_BOT_ID_CLAIM)
+    else:
+        bot_id = getattr(token, USER_BOT_ID_CLAIM, None)
+    return int(bot_id) if bot_id is not None else None
 
 
 def deny_bot(view_method: Callable) -> Callable:

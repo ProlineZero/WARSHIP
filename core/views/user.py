@@ -4,6 +4,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.views import TokenRefreshView
 
+from core.auth.admin_access import IsActiveUser
 from core.auth.bot_access import BotAccessMixin, deny_bot
 from core.serializers.me import UserMeConfirmPhoneSerializer, UserMeSerializer, UserMeUpdateSerializer
 from core.serializers.user import (
@@ -82,7 +83,7 @@ class UserJWTRefreshAPIView(TokenRefreshView):
 
 
 class UserMeAPIView(BotAccessMixin, APIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, IsActiveUser]
 
     def get(self, request, *args, **kwargs):
         return Response(UserMeSerializer(request.user).data, status=status.HTTP_200_OK)
@@ -101,7 +102,7 @@ class UserMeAPIView(BotAccessMixin, APIView):
 
 
 class UserMeConfirmPhoneAPIView(BotAccessMixin, APIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, IsActiveUser]
 
     @deny_bot
     def post(self, request, *args, **kwargs):

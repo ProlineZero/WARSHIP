@@ -10,11 +10,15 @@ from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from django.core.exceptions import ValidationError
 
-from core.auth.bot_access import is_bot_request
+from core.auth.admin_access import IsActiveUser
+from core.auth.bot_access import get_request_user_bot_id, is_bot_request
 from core.models.user import User
 from warship.models import GameSession, ShipPlacement, GameMove
 from warship.matchmaking import find_opponent_from_queue
 from warship.centrifugo import publish_to_game, publish_to_user, generate_centrifugo_token
+from warship.game_status import broadcast_game_status, get_game_status_data
+from warship.services.bot_binding import attach_bot_to_game_if_needed
+from warship.services.game_control import publish_shot_result, queue_manual_move
 from warship.game_presence import (
     clear_presence,
     touch_presence_for_active_game,
@@ -25,7 +29,7 @@ logger = logging.getLogger('ws_app')
 
 class CentrifugoTokenAPIView(APIView):
     """Эндпоинт для получения JWT токена Centrifugo"""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, IsActiveUser]
     
     def get(self, request):
         token = generate_centrifugo_token(request.user.id)
@@ -34,7 +38,7 @@ class CentrifugoTokenAPIView(APIView):
 
 class MatchmakingFindAPIView(APIView):
     """Запрос на поиск игры"""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, IsActiveUser]
     
     def get_active_game_data(self, user: User):
         try:
@@ -113,8 +117,14 @@ class MatchmakingFindAPIView(APIView):
                     player1=user,
                     player2=opponent,
                     status=GameSession.GameStatus.WAITING_SHIPS,
-                    is_training=is_training
+                    is_training=is_training,
                 )
+                if is_bot_request(request):
+                    if game_session.player1_id == user.id:
+                        game_session.player1_bot_id = get_request_user_bot_id(request)
+                    else:
+                        game_session.player2_bot_id = get_request_user_bot_id(request)
+                    game_session.save(update_fields=['player1_bot', 'player2_bot'])
             
             # Удаляем из очереди
             queue.pop(user.id, None)
@@ -171,7 +181,7 @@ class MatchmakingFindAPIView(APIView):
 
 class MatchmakingCancelAPIView(APIView):
     """Отмена поиска игры"""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, IsActiveUser]
     
     def post(self, request):
         queue = cache.get('matchmaking_queue', {})
@@ -188,54 +198,6 @@ class MatchmakingCancelAPIView(APIView):
 
 # --- Вспомогательные функции для Game API ---
 
-def get_game_status_data(game_session):
-    player1_placement = ShipPlacement.objects.filter(
-        game_session=game_session, player=game_session.player1
-    ).first()
-    player2_placement = ShipPlacement.objects.filter(
-        game_session=game_session, player=game_session.player2
-    ).first()
-    
-    current_turn_data = None
-    if game_session.current_turn:
-        current_turn_data = {
-            'id': game_session.current_turn.id,
-            'username': game_session.current_turn.username,
-        }
-    
-    return {
-        'game_id': game_session.id,
-        'status': game_session.status,
-        'player1': {
-            'id': game_session.player1.id,
-            'username': game_session.player1.username,
-            'ships_placed': player1_placement.ships_placed if player1_placement else False,
-        },
-        'player2': {
-            'id': game_session.player2.id if game_session.player2 else None,
-            'username': game_session.player2.username if game_session.player2 else None,
-            'ships_placed': player2_placement.ships_placed if player2_placement else False,
-        } if game_session.player2 else None,
-        'current_turn': current_turn_data,
-        'winner': {
-            'id': game_session.winner.id,
-            'username': game_session.winner.username,
-        } if game_session.winner else None,
-        'board_size': game_session.board_size,
-        'started_at': game_session.started_at.isoformat() if game_session.started_at else None,
-        'finished_at': game_session.finished_at.isoformat() if game_session.finished_at else None,
-    }
-
-
-def broadcast_game_status(game_session):
-    status_data = get_game_status_data(game_session)
-    publish_to_game(game_session.id, {
-        'action': 'game_status',
-        'status': 'success',
-        'data': status_data
-    })
-
-
 def _get_participant_game(request, game_id, *, touch_presence=True):
     game_session = GameSession.objects.filter(id=game_id).select_related('player1', 'player2').first()
     if not game_session:
@@ -245,6 +207,7 @@ def _get_participant_game(request, game_id, *, touch_presence=True):
         participant_ids.append(game_session.player2_id)
     if request.user.id not in participant_ids:
         return None, Response({'error': 'Вы не участник этой игры'}, status=403)
+    attach_bot_to_game_if_needed(game_session, request)
     if touch_presence:
         touch_presence_for_active_game(game_session, request.user.id)
     return game_session, None
@@ -252,7 +215,7 @@ def _get_participant_game(request, game_id, *, touch_presence=True):
 
 class GameLeaveAPIView(APIView):
     """Явный выход из игры (ускоряет отмену при уходе обоих)."""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, IsActiveUser]
 
     def post(self, request, game_id):
         game_session, error_response = _get_participant_game(request, game_id, touch_presence=False)
@@ -271,7 +234,7 @@ class GameLeaveAPIView(APIView):
 
 class GameStatusAPIView(APIView):
     """Получение статуса игры"""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, IsActiveUser]
     
     def get(self, request, game_id):
         game_session, error_response = _get_participant_game(request, game_id)
@@ -287,7 +250,7 @@ class GameStatusAPIView(APIView):
 
 class GameBoardAPIView(APIView):
     """Получение состояния доски"""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, IsActiveUser]
     
     def get(self, request, game_id):
         game_session, error_response = _get_participant_game(request, game_id)
@@ -325,7 +288,7 @@ class GameBoardAPIView(APIView):
 
 class GamePlaceShipsAPIView(APIView):
     """Размещение кораблей"""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, IsActiveUser]
     
     def post(self, request, game_id):
         ships_data = request.data.get('ships', [])
@@ -387,72 +350,76 @@ class GamePlaceShipsAPIView(APIView):
 
 class GameMakeShotAPIView(APIView):
     """Выполнение выстрела"""
-    permission_classes = [IsAuthenticated]
-    
+    permission_classes = [IsAuthenticated, IsActiveUser]
+
     def post(self, request, game_id):
         row = request.data.get('row')
         col = request.data.get('col')
-        
+
         if row is None or col is None:
             return Response({'error': 'Не указаны координаты выстрела (row, col)'}, status=400)
-            
+
         game_session, error_response = _get_participant_game(request, game_id)
         if error_response:
             return error_response
-            
+
         if game_session.status == GameSession.GameStatus.WAITING_SHIPS:
             return Response({'error': 'Игра еще не начата'}, status=400)
-            
+
         if game_session.status == GameSession.GameStatus.FINISHED:
             return Response({'error': 'Игра уже завершена'}, status=400)
-            
+
         if game_session.current_turn_id != request.user.id:
             return Response({'error': 'Сейчас не ваш ход'}, status=400)
-            
+
+        if game_session.is_paused:
+            return Response({'error': 'Игра на паузе'}, status=423)
+
         from warship.models import make_shot
+
+        if game_session.admin_control_mode == GameSession.AdminControlMode.MANUAL_STEP:
+            from warship.models import validate_shot
+
+            shot_validation = validate_shot(game_session, request.user, row, col)
+            if not shot_validation['valid']:
+                return Response({'error': shot_validation['error']}, status=400)
+
+            queued = queue_manual_move(
+                game_session,
+                request.user,
+                row,
+                col,
+                bot_id=get_request_user_bot_id(request),
+            )
+            return Response({
+                'action': 'make_shot',
+                'status': 'pending',
+                'data': queued,
+            }, status=202)
+
         try:
             result = make_shot(game_session, request.user, row, col)
         except Exception as e:
             return Response({'error': str(e)}, status=400)
-            
+
         if not result['success']:
+            if result.get('retry_after_ms'):
+                return Response({'error': result.get('error'), 'retry_after_ms': result['retry_after_ms']}, status=429)
             return Response({'error': result.get('error', 'Ошибка выстрела')}, status=400)
-            
-        winner = result.get('winner')
-        result_to_send = dict(result)
-        if winner:
-            result_to_send['winner'] = {'id': winner.id, 'username': winner.username}
-            
-        publish_to_game(game_session.id, {
-            'action': 'shot_result',
-            'status': 'success',
-            'data': result_to_send
-        })
-        
-        broadcast_game_status(game_session)
-        
-        if result.get('game_finished'):
-            publish_to_game(game_session.id, {
-                'action': 'game_finished',
-                'status': 'success',
-                'data': {
-                    'game_id': game_session.id,
-                    'winner': result_to_send['winner'],
-                    'finished_at': game_session.finished_at.isoformat() if game_session.finished_at else None,
-                }
-            })
-            
+
+        result_to_send = publish_shot_result(game_session, result)
+
         return Response({
             'action': 'make_shot',
             'status': 'success',
-            'data': result_to_send
+            'data': result_to_send,
         })
 
 
 # Апи для того чтобы бросить вызов другому игроку
 class GameChallengeAPIView(APIView):
     """Бросить вызов другому игроку"""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, IsActiveUser]
     
     def post(self, request):
         opponent_id = request.data.get('opponent_id')
@@ -471,8 +438,11 @@ class GameChallengeAPIView(APIView):
             player1=user,
             player2=opponent,
             status=GameSession.GameStatus.WAITING_CHALLENGE,
-            is_training=True
+            is_training=True,
         )
+        if is_bot_request(request):
+            game_session.player1_bot_id = get_request_user_bot_id(request)
+            game_session.save(update_fields=['player1_bot'])
 
         challenge_data = {
             "action": "challenge_created",
