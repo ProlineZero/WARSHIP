@@ -35,11 +35,27 @@
             "X-Centrifugo-Proxy-Key": "dev-proxy-secret"
           }
         }
+      },
+      "publish": {
+        "endpoint": "http://web:8000/api/warship/centrifugo/proxy/publish/",
+        "http": {
+          "static_headers": {
+            "X-Centrifugo-Proxy-Key": "dev-proxy-secret"
+          }
+        }
       }
     },
     "without_namespace": {
       "subscribe_proxy_enabled": true,
-      "sub_refresh_proxy_enabled": true
-    }
+      "sub_refresh_proxy_enabled": true,
+      "allow_publish_for_subscriber": true
+    },
+    "namespaces": [
+      {
+        "name": "finish",
+        "subscribe_proxy_enabled": true,
+        "publish_proxy_enabled": true
+      }
+    ]
   }
 }

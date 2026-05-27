@@ -9,6 +9,7 @@ import httpx
 from config import BOARD_SIZE
 from load_test.async_realtime import AsyncRealtimeClient
 from load_test.stats import StatsCollector
+from peer_battle import PeerBattleState
 from ships import generate_random_fleet
 
 logger = logging.getLogger(__name__)
@@ -77,6 +78,8 @@ class AsyncPlayer:
         self._realtime: AsyncRealtimeClient | None = None
         self._ready = asyncio.Event()
         self._barrier: asyncio.Event | None = None
+        self._peer_fleet: list[dict] | None = None
+        self._peer_battle: PeerBattleState | None = None
 
     def set_barrier(self, barrier: asyncio.Event) -> None:
         self._barrier = barrier
@@ -212,6 +215,7 @@ class AsyncPlayer:
         if my_info.get('ships_placed'):
             return
         fleet = generate_random_fleet(BOARD_SIZE)
+        self._peer_fleet = fleet
         await self._request(
             'POST',
             f'/warship/game/{self.game_id}/place_ships/',
@@ -283,13 +287,143 @@ class AsyncPlayer:
             return 'hit_again'
         return 'wait'
 
+    async def _ensure_peer_battle(self, state: dict) -> PeerBattleState | None:
+        if self._peer_battle or not self.game_id or not self.user_id:
+            return self._peer_battle
+        if not self._peer_fleet:
+            return None
+
+        status_resp = await self._request('GET', f'/warship/game/{self.game_id}/status/')
+        data = status_resp.get('data', {})
+        player1 = data.get('player1') or {}
+        player2 = data.get('player2') or {}
+        player1_id = player1.get('id')
+        player2_id = player2.get('id')
+        if not player1_id or not player2_id:
+            return None
+
+        current_turn = data.get('current_turn') or {}
+        self._peer_battle = PeerBattleState(
+            game_id=self.game_id,
+            user_id=self.user_id,
+            player1_id=player1_id,
+            player2_id=player2_id,
+            fleet=self._peer_fleet,
+        )
+        if current_turn.get('id'):
+            self._peer_battle.current_turn_id = current_turn['id']
+        return self._peer_battle
+
+    async def _publish_peer_finish(self, winner_id: int) -> None:
+        if not self._realtime or not self.game_id:
+            return
+        await self._realtime.publish_finish(
+            self.game_id,
+            {'action': 'game_finished', 'winner_id': winner_id},
+        )
+
+    async def _handle_peer_event(self, event: dict, battle: PeerBattleState) -> str | None:
+        action = event.get('action')
+
+        if action == 'game_started':
+            current_turn = (event.get('data') or {}).get('current_turn') or {}
+            if current_turn.get('id'):
+                battle.current_turn_id = current_turn['id']
+            return None
+
+        if action == 'shot':
+            if event.get('player_id') == self.user_id:
+                return None
+            shot_result = battle.handle_incoming_shot(event)
+            if shot_result and self._realtime:
+                await self._realtime.publish_game(shot_result)
+                if shot_result.get('game_finished'):
+                    await self._publish_peer_finish(int(shot_result['winner_id']))
+                    self.stats.record_game_finished()
+                    return 'finished'
+            return None
+
+        if action == 'shot_result':
+            if event.get('shooter_id') != self.user_id:
+                return None
+            game_over = battle.apply_shot_result(event)
+            if game_over:
+                await self._publish_peer_finish(self.user_id)
+                self.stats.record_game_finished()
+                return 'finished'
+            return None
+
+        if action == 'game_finished':
+            self.stats.record_game_finished()
+            return 'finished'
+
+        return None
+
+    async def _play_peer_until_finished(self, timeout: float) -> None:
+        deadline = time.monotonic() + timeout
+        state = await self._fetch_game_state()
+        watch_actions = {'game_started', 'shot', 'shot_result', 'game_finished'}
+
+        if self._realtime and self.game_id:
+            await self._realtime.subscribe_finish(self.game_id)
+
+        while time.monotonic() < deadline:
+            if state.get('status') == 'waiting_ships':
+                await self.place_ships_if_needed()
+                state = await self._fetch_game_state()
+                continue
+
+            if state.get('status') == 'cancelled':
+                self.stats.record_game_cancelled()
+                return
+
+            if state.get('status') == 'finished':
+                self.stats.record_game_finished()
+                return
+
+            battle = await self._ensure_peer_battle(state)
+
+            if self._realtime:
+                pending, matched = await self._realtime.wait_game_event_or_drain(
+                    watch_actions,
+                    self.poll_interval,
+                )
+                for event in pending:
+                    if battle:
+                        result = await self._handle_peer_event(event, battle)
+                        if result == 'finished':
+                            return
+                if matched and battle:
+                    result = await self._handle_peer_event(matched, battle)
+                    if result == 'finished':
+                        return
+
+            if battle and battle.is_my_turn() and self._realtime:
+                shot = battle.pick_shot()
+                if shot:
+                    await self._realtime.publish_game(battle.build_shot_message(shot[0], shot[1]))
+                if self.turn_delay > 0:
+                    await asyncio.sleep(self.turn_delay)
+                continue
+
+            if self.poll_interval > 0:
+                await asyncio.sleep(self.poll_interval)
+            state = await self._fetch_game_state()
+
     async def play_until_finished(self, timeout: float) -> None:
         if not self.game_id:
             return
 
+        state = await self._fetch_game_state()
+        status_resp = await self._request('GET', f'/warship/game/{self.game_id}/status/')
+        play_mode = status_resp.get('data', {}).get('play_mode', 'server')
+
+        if play_mode == 'peer' and self.use_ws:
+            await self._play_peer_until_finished(timeout)
+            return
+
         deadline = time.monotonic() + timeout
         my_shots: set[tuple[int, int]] = set()
-        state = await self._fetch_game_state()
         watch_actions = {'game_status', 'game_started', 'shot_result', 'game_finished'}
 
         while time.monotonic() < deadline:

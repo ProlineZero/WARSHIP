@@ -19,6 +19,7 @@ from warship.centrifugo import publish_to_game, publish_to_user, generate_centri
 from warship.game_status import broadcast_game_status, get_game_status_data
 from warship.services.bot_binding import attach_bot_to_game_if_needed
 from warship.services.game_control import publish_shot_result, queue_manual_move
+from warship.services.peer_finish import finalize_peer_game
 from warship.game_presence import (
     clear_presence,
     touch_presence_for_active_game,
@@ -76,6 +77,7 @@ class MatchmakingFindAPIView(APIView):
                     'id': active_game.current_turn.id,
                     'username': active_game.current_turn.username,
                 } if active_game.current_turn else None,
+                'play_mode': active_game.play_mode,
             }
         except Exception as e:
             logger.error(f"Ошибка при получении активной игры для пользователя {user.id}: {e}")
@@ -113,11 +115,15 @@ class MatchmakingFindAPIView(APIView):
             if existing_game:
                 game_session = existing_game
             else:
+                play_mode = (
+                    GameSession.PlayMode.PEER if is_training else GameSession.PlayMode.SERVER
+                )
                 game_session = GameSession.objects.create(
                     player1=user,
                     player2=opponent,
                     status=GameSession.GameStatus.WAITING_SHIPS,
                     is_training=is_training,
+                    play_mode=play_mode,
                 )
                 if is_bot_request(request):
                     if game_session.player1_id == user.id:
@@ -273,7 +279,20 @@ class GameBoardAPIView(APIView):
             game_session=game_session,
             player=opponent
         ).values('row', 'col', 'hit', 'ship_destroyed', 'ship_size')) if opponent else []
-        
+
+        if game_session.is_peer_mode() and game_session.status != GameSession.GameStatus.WAITING_SHIPS:
+            return Response({
+                'action': 'board_state',
+                'status': 'success',
+                'data': {
+                    'my_ships': [],
+                    'my_shots': [],
+                    'opponent_shots': [],
+                    'board_size': game_session.board_size,
+                    'play_mode': game_session.play_mode,
+                },
+            })
+
         return Response({
             'action': 'board_state',
             'status': 'success',
@@ -282,6 +301,7 @@ class GameBoardAPIView(APIView):
                 'my_shots': my_shots,
                 'opponent_shots': opponent_shots,
                 'board_size': game_session.board_size,
+                'play_mode': game_session.play_mode,
             }
         })
 
@@ -334,8 +354,11 @@ class GamePlaceShipsAPIView(APIView):
                         'game_id': game_session.id,
                         'current_turn': current_turn_data,
                         'started_at': game_session.started_at.isoformat() if game_session.started_at else None,
+                        'play_mode': game_session.play_mode,
                     }
                 })
+                if game_session.is_peer_mode():
+                    game_session.purge_placement_data()
             except ValidationError:
                 pass
                 
@@ -362,6 +385,15 @@ class GameMakeShotAPIView(APIView):
         game_session, error_response = _get_participant_game(request, game_id)
         if error_response:
             return error_response
+
+        if game_session.is_peer_mode():
+            return Response(
+                {
+                    'error': 'В режиме peer ходы выполняются через Centrifugo',
+                    'play_mode': game_session.play_mode,
+                },
+                status=409,
+            )
 
         if game_session.status == GameSession.GameStatus.WAITING_SHIPS:
             return Response({'error': 'Игра еще не начата'}, status=400)
@@ -413,6 +445,34 @@ class GameMakeShotAPIView(APIView):
             'action': 'make_shot',
             'status': 'success',
             'data': result_to_send,
+        })
+
+
+class GameFinishAPIView(APIView):
+    """Завершение peer-игры (fallback к publish на finish:{id})."""
+    permission_classes = [IsAuthenticated, IsActiveUser]
+
+    def post(self, request, game_id):
+        winner_id = request.data.get('winner_id')
+        if winner_id is None:
+            return Response({'error': 'Не указан winner_id'}, status=400)
+
+        game_session, error_response = _get_participant_game(request, game_id)
+        if error_response:
+            return error_response
+
+        if not game_session.is_peer_mode():
+            return Response({'error': 'Завершение через API доступно только в режиме peer'}, status=400)
+
+        try:
+            payload = finalize_peer_game(game_session, int(winner_id), request.user.id)
+        except ValidationError as exc:
+            return Response({'error': str(exc)}, status=400)
+
+        return Response({
+            'action': 'game_finished',
+            'status': 'success',
+            'data': payload,
         })
 
 

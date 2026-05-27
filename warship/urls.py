@@ -1,6 +1,10 @@
 from django.urls import path
 from warship import views
-from warship.centrifugo_proxy import CentrifugoSubscribeProxyView, CentrifugoSubRefreshProxyView
+from warship.centrifugo_proxy import (
+    CentrifugoPublishProxyView,
+    CentrifugoSubscribeProxyView,
+    CentrifugoSubRefreshProxyView,
+)
 
 urlpatterns = [
     # Matchmaking
@@ -29,4 +33,10 @@ urlpatterns = [
         CentrifugoSubRefreshProxyView.as_view(),
         name='centrifugo-proxy-sub-refresh',
     ),
+    path(
+        'centrifugo/proxy/publish/',
+        CentrifugoPublishProxyView.as_view(),
+        name='centrifugo-proxy-publish',
+    ),
+    path('game/<int:game_id>/finish/', views.GameFinishAPIView.as_view(), name='game-finish'),
 ]

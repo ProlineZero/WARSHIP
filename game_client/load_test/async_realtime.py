@@ -58,6 +58,7 @@ class AsyncRealtimeClient:
         self._client: Client | None = None
         self._user_sub = None
         self._game_sub = None
+        self._finish_sub = None
         self._user_queue: asyncio.Queue = asyncio.Queue()
         self._game_queue: asyncio.Queue = asyncio.Queue()
 
@@ -91,7 +92,32 @@ class AsyncRealtimeClient:
         )
         await self._game_sub.subscribe()
 
+    async def subscribe_finish(self, game_id: int) -> None:
+        if not self._client:
+            return
+        channel = f'finish:{game_id}'
+        if self._finish_sub:
+            await self._finish_sub.unsubscribe()
+        self._finish_sub = self._client.new_subscription(channel)
+        await self._finish_sub.subscribe()
+
+    async def publish_game(self, data: dict) -> None:
+        if not self._game_sub:
+            raise RuntimeError('Нет подписки на game-канал')
+        await self._game_sub.publish(data)
+
+    async def publish_finish(self, game_id: int, data: dict) -> None:
+        if not self._client:
+            raise RuntimeError('Centrifugo не подключён')
+        if not self._finish_sub:
+            await self.subscribe_finish(game_id)
+        if self._finish_sub:
+            await self._finish_sub.publish(data)
+
     async def disconnect(self) -> None:
+        if self._finish_sub:
+            await self._finish_sub.unsubscribe()
+            self._finish_sub = None
         if self._game_sub:
             await self._game_sub.unsubscribe()
             self._game_sub = None

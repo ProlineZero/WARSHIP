@@ -12,6 +12,8 @@ from warship.models import GameSession
 logger = logging.getLogger('ws_app')
 
 GAME_CHANNEL_PATTERN = re.compile(r'^game_(\d+)$')
+FINISH_CHANNEL_PATTERN = re.compile(r'^finish:(\d+)$')
+USER_CHANNEL_PATTERN = re.compile(r'^user_(\d+)$')
 
 TERMINAL_STATUSES = (
     GameSession.GameStatus.FINISHED,
@@ -22,6 +24,20 @@ TERMINAL_STATUSES = (
 def parse_game_id_from_channel(channel: str) -> int | None:
     match = GAME_CHANNEL_PATTERN.match(channel or '')
     return int(match.group(1)) if match else None
+
+
+def parse_finish_game_id(channel: str) -> int | None:
+    match = FINISH_CHANNEL_PATTERN.match(channel or '')
+    return int(match.group(1)) if match else None
+
+
+def parse_user_id_from_channel(channel: str) -> int | None:
+    match = USER_CHANNEL_PATTERN.match(channel or '')
+    return int(match.group(1)) if match else None
+
+
+def finish_channel_name(game_id: int) -> str:
+    return f'finish:{game_id}'
 
 
 def _presence_cache_key(game_id: int, user_id: int) -> str:

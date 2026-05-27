@@ -93,6 +93,7 @@ class AdminBotChallengeAPIView(APIView):
             player2_bot=bot,
             status=GameSession.GameStatus.WAITING_SHIPS,
             is_training=True,
+            play_mode=GameSession.PlayMode.PEER,
         )
 
         publish_to_user(request.user.id, {
@@ -142,6 +143,7 @@ class AdminBotVersusAPIView(APIView):
         if not bot1 or not bot2:
             raise NotFound(detail='Один из ботов не найден.')
 
+        play_mode = GameSession.PlayMode.PEER if is_training else GameSession.PlayMode.SERVER
         game_session = GameSession.objects.create(
             player1=bot1.user,
             player2=bot2.user,
@@ -149,6 +151,7 @@ class AdminBotVersusAPIView(APIView):
             player2_bot=bot2,
             status=GameSession.GameStatus.WAITING_SHIPS,
             is_training=is_training,
+            play_mode=play_mode,
         )
 
         for bot in (bot1, bot2):
@@ -263,6 +266,9 @@ class AdminGameControlAPIView(APIView):
         if 'is_paused' in request.data:
             game.is_paused = bool(request.data['is_paused'])
             update_fields.append('is_paused')
+        if 'play_mode' in request.data:
+            game.play_mode = request.data['play_mode']
+            update_fields.append('play_mode')
 
         if update_fields:
             game.save(update_fields=update_fields)

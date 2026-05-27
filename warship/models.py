@@ -113,11 +113,21 @@ class GameSession(models.Model):
         verbose_name='Бот второго игрока',
     )
 
+    class PlayMode(models.TextChoices):
+        SERVER = 'server', 'Серверные ходы'
+        PEER = 'peer', 'Ходы через Centrifugo'
+
     class AdminControlMode(models.TextChoices):
         NORMAL = 'normal', 'Обычный'
         DELAYED = 'delayed', 'С задержкой'
         MANUAL_STEP = 'manual_step', 'Ручной шаг'
 
+    play_mode = models.CharField(
+        max_length=20,
+        choices=PlayMode.choices,
+        default=PlayMode.SERVER,
+        verbose_name='Режим игры',
+    )
     admin_control_mode = models.CharField(
         max_length=20,
         choices=AdminControlMode.choices,
@@ -223,6 +233,13 @@ class GameSession(models.Model):
             return self.player1
         else:
             raise ValidationError('Игрок не участвует в этой игре')
+
+    def is_peer_mode(self) -> bool:
+        return self.play_mode == self.PlayMode.PEER
+
+    def purge_placement_data(self) -> None:
+        """Удаляет координаты кораблей из БД после старта peer-игры."""
+        self.ship_placements.update(ships=[])
 
 
 class ShipPlacement(models.Model):

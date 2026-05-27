@@ -45,6 +45,7 @@ def get_game_status_data(game_session):
             'username': game_session.winner.username,
         } if game_session.winner else None,
         'board_size': game_session.board_size,
+        'play_mode': game_session.play_mode,
         'admin_control_mode': game_session.admin_control_mode,
         'move_delay_ms': game_session.move_delay_ms,
         'is_paused': game_session.is_paused,
