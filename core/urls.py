@@ -11,7 +11,8 @@ from core.views.user import (
     UserOTPRequestAPIView,
 )
 from core.views.user_bot import UserBotAPIView, UserBotLoginAPIView
-
+from core import admin_urls
+from warship import urls as warship_urls
 
 urlpatterns = [
     path("user/me/", include(
@@ -38,3 +39,5 @@ urlpatterns = [
     path("auth/register/request-otp/", UserOTPRequestAPIView.as_view(), name="auth-register-request-otp"),
     path("auth/register/confirm-otp/", UserOTPConfirmAPIView.as_view(), name="auth-register-confirm-otp"),
 ]
+urlpatterns += admin_urls.urlpatterns
+urlpatterns += warship_urls.urlpatterns
